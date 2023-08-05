@@ -1,0 +1,24 @@
+numpy
+cffi
+Pillow
+pyquaternion
+html-testRunner
+setuptools
+natsort
+matplotlib
+wandb
+pynput
+matplotlib
+opencv-python
+scikit-image
+numba
+# pycuda
+opencv-contrib-python
+tqdm
+loguru
+pre-commit
+jsonpickle
+scikit-learn
+nvitop
+timm
+# maniskill2
