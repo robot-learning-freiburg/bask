@@ -179,3 +179,9 @@ python src/kp_encode_trajectories.py -f cloning -m -o -t PickSingleYCB-v0-065-a_
 ```
 python src/evaluate.py -f cloning -m -o -t PickSingleYCB-v0-065-a_cups -p encoder -e keypoints --cam base --config configs/maniskill-ycb-cups-pretrain.py
 ```
+
+
+## Model Checkpoints
+
+For downloading model checkpoints, please visit the [project website](http://bask.cs.uni-freiburg.de/).
+Checkpoints are currently being uploaded and will be available shortly.
