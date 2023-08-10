@@ -172,7 +172,7 @@ python src/kp_encode_trajectories.py -f cloning -m -o -t PickSingleYCB-v0-065-a_
 
 - Policy learning
 ```
-python src/kp_encode_trajectories.py -f cloning -m -o -t PickSingleYCB-v0-065-a_cups -p encoder -e keypoints --cam base --pretrain_feedback dcm --config configs/maniskill-ycb-cups-pretrain.py --kp_pre_complete my-kp-selection
+python src/behavior_cloning.py -f cloning -m -o -t PickSingleYCB-v0-065-a_cups -p encoder -e keypoints --cam base --pretrain_feedback dcm --config configs/maniskill-ycb-cups-pretrain.py --kp_pre_complete my-kp-selection
 ```
 
 - Evaluation
