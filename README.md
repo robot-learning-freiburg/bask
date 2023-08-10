@@ -186,9 +186,12 @@ python src/evaluate.py -f cloning -m -o -t PickSingleYCB-v0-065-a_cups -p encode
 You can download our pretrained model checkpoints by clicking the links below. Afterwards place them in `<data_root>/<task>/`.
 For additional checkpoints, please contact the authors.
 
-[BASK on Microwave](bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-CloseMicrowave_policy.pt)
-[BASK on Lid](bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-TakeLidOffSaucepan_policy.pt)
-[BASK on Phone](bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-PhoneOnBase_policy.pt)
-[BASK on Rubbish](bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-PutRubbishInBin_policy.pt)
+[BASK on Microwave](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-CloseMicrowave_policy.pt)
+
+[BASK on Lid](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-TakeLidOffSaucepan_policy.pt)
+
+[BASK on Phone](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-PhoneOnBase_policy.pt)
+
+[BASK on Rubbish](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-PutRubbishInBin_policy.pt)
 
 
