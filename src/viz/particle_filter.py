@@ -22,7 +22,7 @@ class ParticleFilterViz:
 
         self.show = False
 
-    def reset_traj(self):
+    def reset_episode(self):
         self.traj_counter += 1
         self.obs_counter = 0
 

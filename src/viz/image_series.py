@@ -7,11 +7,9 @@ from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 
 from viz.operations import channel_front2back, rgb2gray
 
-# TODO: ndarrays are actually tensors! rename!
 
-
-def vis_series(ndarray, channeled=True, file_name=None):
-    num_images = ndarray.shape[0]
+def vis_series(img_tensor, channeled=True, file_name=None):
+    num_images = img_tensor.shape[0]
 
     no_cols = int(math.ceil(math.sqrt(num_images)))
     no_rows = no_cols
@@ -28,7 +26,7 @@ def vis_series(ndarray, channeled=True, file_name=None):
         x = i // no_cols
         y = i % no_cols
         ax = fig.add_subplot(gs[x, y])
-        img_i = channel_front2back(ndarray[i]) if channeled else ndarray[i]
+        img_i = channel_front2back(img_tensor[i]) if channeled else img_tensor[i]
         ax.imshow(img_i)
         ax.axis('off')
         ax.set_aspect('equal')
@@ -40,8 +38,8 @@ def vis_series(ndarray, channeled=True, file_name=None):
         plt.show()
 
 
-def vis_series_w_mask(ndarray, mask):
-    num_images = ndarray.shape[0]
+def vis_series_w_mask(img_tensor, mask):
+    num_images = img_tensor.shape[0]
 
     no_cols = int(math.ceil(math.sqrt(num_images)))
     no_rows = no_cols
@@ -65,8 +63,36 @@ def vis_series_w_mask(ndarray, mask):
         x = i // no_cols
         y = i % no_cols
         ax = plt.subplot(gs[x, y])
-        ax.imshow(rgb2gray(channel_front2back(ndarray[i])), cmap='gray', alpha=0.5)
+        ax.imshow(rgb2gray(channel_front2back(img_tensor[i])), cmap='gray', alpha=0.5)
         ax.imshow(mask[i], cmap=mask_map, alpha=0.8, interpolation='none', vmin=0, vmax=9)
+        ax.axis('off')
+        ax.set_aspect('equal')
+    plt.subplots_adjust(wspace=0, hspace=0)
+    plt.show()
+
+
+def vis_series_w_depth(ndarray, depth):
+    num_images = ndarray.shape[0]
+
+    no_cols = int(math.ceil(math.sqrt(num_images)))
+    no_rows = no_cols
+
+    plt.figure(figsize=(no_cols+1, no_rows+1))
+
+    gs = gridspec.GridSpec(
+        no_rows, no_cols,
+        wspace=0, hspace=0,
+        top=1.-0.5/(no_rows + 1), bottom=0.5/(no_rows+1),
+        left=0.5/(no_cols + 1), right=1-0.5/(no_cols + 1))
+
+    for i in range(num_images):
+        x = i // no_cols
+        y = i % no_cols
+        ax = plt.subplot(gs[x, y])
+        ax.imshow(rgb2gray(channel_front2back(
+            ndarray[i])), cmap='gray', alpha=0.5)
+        ax.imshow(depth[i], cmap='jet', alpha=0.8,
+                  interpolation='none', vmin=0, vmax=0.5)
         ax.axis('off')
         ax.set_aspect('equal')
     plt.subplots_adjust(wspace=0, hspace=0)

@@ -1,68 +1,86 @@
+from types import MappingProxyType
+
 import cv2
 import gym
 import mani_skill2.envs  # noqa: F401
 import numpy as np
+import torch
 from loguru import logger
 
 from env.environment import BaseEnvironment
-from env.observation import MSObservation
 from utils.geometry import np_invert_homogenous_transform
+from utils.misc import invert_dict
+from utils.observation import (CameraOrder, SceneObservation,
+                               SingleCamObservation, dict_to_tensordict,
+                               empty_batchsize)
 
 ACTION_MODE = "pd_ee_delta_pose"
 OBS_MODE = "state_dict+image"
 
 
-cam_name_tranlation = {
-    "hand_camera": "w",
-    "base_camera": "b",
-    "overhead": "o",
-}
+default_cameras = tuple(("hand_camera", "base_camera"))
+
+cam_name_tranlation = MappingProxyType({
+    "hand_camera": "wrist",
+    "base_camera": "base",
+    "overhead": "overhead",
+})
+
+inv_cam_name_tranlation = invert_dict(cam_name_tranlation)
+
 
 class ManiSkillEnv(BaseEnvironment):
-    def __init__(self, config, ms_config=None):
+    def __init__(self, config):
         super().__init__(config)
+
+        # NOTE: removed ms_config dict. Just put additional kwargs into the
+        # config dict and treat them here and in launch_simulation_env.
 
         # ManiSkill controllers have action space normalized to [-1,1].
         # Max speed is a bit fast for teleop, so scale down.
         self._delta_pos_scale = 0.25
         self._delta_angle_scale = 0.5
 
-        if "image_size" in config and config["image_size"] is not None:
-            image_size = config["image_size"]
-        else:
-            image_size = (256, 256)
-
         config['real_depth'] = False
+
+        self.cameras = config["cameras"]
+        self.cameras_ms = [inv_cam_name_tranlation[c] for c in self.cameras]
+
+        image_size = tuple((self.image_height, self.image_width))
 
         self.camera_cfgs = {
             "width": image_size[1],
             "height": image_size[0],
             "use_stereo_depth": config.get("real_depth", False),
             "add_segmentation": True,
-            "overhead": {  # can pass specific params per cam as well
-                # 'p': [0.2, 0, 0.2],
-                # Quaternions are [w, x, y, z]
-                # 'q': [7.7486e-07, -0.194001, 7.7486e-07, 0.981001]
-            },
-            "base_camera": {
-                'p': [0.2, 0, 0.2],
-                'q': [0, 0.194, 0, -0.981]  # Quaternions are [w, x, y, z]
-            }
+            # NOTE: these are examples of how to pass camera params.
+            # Should specify these in the config file.
+            # "overhead": {  # can pass specific params per cam as well
+            #     'p': [0.2, 0, 0.2],
+            #     # Quaternions are [w, x, y, z]
+            #     'q': [7.7486e-07, -0.194001, 7.7486e-07, 0.981001]
+            # },
+            # "base_camera": {
+            #     'p': [0.2, 0, 0.2],
+            #     'q': [0, 0.194, 0, -0.981]  # Quaternions are [w, x, y, z]
+            # }
         }
 
         self.extra_cams = []
 
         for c, pq in config['camera_pose'].items():
-            if self.camera_cfgs.get(c) is None:
-                self.camera_cfgs[c] = {}
-            self.extra_cams.append(c)
-            self.camera_cfgs[c]['p'] = pq[:3]
-            self.camera_cfgs[c]['q'] = pq[3:]
+            ms_name = inv_cam_name_tranlation[c]
+            if self.camera_cfgs.get(ms_name) is None:
+                self.camera_cfgs[ms_name] = {}
+            if ms_name not in default_cameras:
+                self.extra_cams.append(ms_name)
+            self.camera_cfgs[ms_name]['p'] = pq[:3]
+            self.camera_cfgs[ms_name]['q'] = pq[3:]
 
         self.task_name = config["task"]
         self.headless = config["headless_env"]
+
         self.gym_env = None
-        self.camera_pose = None
 
         self.render_sapien = config.get("render_sapien", False)
         self.bg_name = config.get("background", None)
@@ -70,12 +88,15 @@ class ManiSkillEnv(BaseEnvironment):
 
         self.seed = config.get("seed", None)
 
+        if config.get("static_env"):
+            raise NotImplementedError
+
+        # NOTE: would like to make the horizon configurable, but didn't figure
+        # it out how to make this work with the Maniskill env registry. TODO
         # self.horizon = -1
 
         if self.model_ids is None:
             self.model_ids = []
-
-        self.ms_config = ms_config or {}
 
         if not self.render_sapien and not self.headless:
             self.cam_win_title = "Observation"
@@ -166,6 +187,9 @@ class ManiSkillEnv(BaseEnvironment):
             # "max_episode_steps": self.horizon,
         }
 
+        if not self.task_name.startswith("Pick"):
+            kwargs.pop('model_ids')  # model_ids only needed for pick tasks
+
         # NOTE: full list of arguments
         # obs_mode = None,
         # reward_mode = None,  Don't need a reward when imitating.
@@ -180,9 +204,6 @@ class ManiSkillEnv(BaseEnvironment):
         # camera_cfgs: dict = None,
         # render_camera_cfgs: dict = None,
         # bg_name: str = None,
-
-        # TODO: need recursive update? Also switch order to be sure?
-        kwargs.update(self.ms_config)
 
         self.gym_env = gym.make(env_name, **kwargs)
 
@@ -203,9 +224,6 @@ class ManiSkillEnv(BaseEnvironment):
 
         obs = self.gym_env.reset(**kwargs)
 
-        # if self.camera_pose:
-        #     self.set_camera_pose(self.camera_pose)
-
         obs = self.obs_split(obs)
 
         return obs
@@ -216,38 +234,71 @@ class ManiSkillEnv(BaseEnvironment):
     def set_state(self, state):
         self.gym_env.set_state(state)
 
-    def step(self, action, manual_demo=False, postprocess=True, invert=True):
+    def _step(self, action: np.ndarray, postprocess: bool = True,
+              delay_gripper: bool = True, scale_action: bool = True,
+              invert_xy: bool = True
+              ) -> tuple[SceneObservation, float, bool, dict]:
+        """
+        Postprocess the action and execute it in the environment.
+        Catches invalid actions and executes a zero action instead.
+
+        Parameters
+        ----------
+        action : np.ndarray
+            The raw action predicted by a policy.
+        postprocess : bool, optional
+            Whether to postprocess the action at all, by default True
+        delay_gripper : bool, optional
+            Whether to delay the gripper action. Usually needed for ML
+            policies, by default True
+        scale_action : bool, optional
+            Whether to scale the action. Usually needed for ML policies,
+            by default True
+        invert_xy : bool, optional
+            Whether to invert x and y translation. Makes it easier to teleop
+            in ManiSkill because of the base camera setup, by default True
+
+        Returns
+        -------
+        SceneObservation, float, bool, dict
+            The observation, reward, done flag and info dict.
+
+        Raises
+        ------
+        Exception
+            Do not yet know how ManiSkill handles invalid actions, so raise
+            an exception if it occurs in stepping the action.
+        """
         # TODO: don't postprocess for GMMs.
         if postprocess:
-            action_delayed = self.postprocess_action(action,
-                                                     manual_demo=manual_demo,
-                                                     return_euler=True)
+            action = self.postprocess_action(
+                action, scale_action=scale_action, delay_gripper=delay_gripper,
+                return_euler=True)
         else:
-            action_delayed = action
+            action = action
 
-
-        if invert:
+        if invert_xy:
             # Invert x, y movement and rotation, but not gripper and z.
-            action_delayed[:2] = -action_delayed[:2]
-            action_delayed[3:-2] = -action_delayed[3:-2]
+            action[:2] = -action[:2]
+            action[3:-2] = -action[3:-2]
 
-        zero_action = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, action_delayed[-1]]
+        zero_action = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, action[-1]]
 
-        if np.isnan(action_delayed).any():
+        if np.isnan(action).any():
             logger.warning("NaN action, skipping")
-            action_delayed = zero_action
+            action = zero_action
 
         try:
-            next_obs, reward, done, info = self.gym_env.step(action_delayed)
+            next_obs, reward, done, info = self.gym_env.step(action)
         except Exception as e:
-            logger.info("Skipping invalid action {}.".format(action_delayed))
+            logger.info("Skipping invalid action {}.".format(action))
 
             logger.warning("Don't yet know how ManiSkill handles invalid actions")
             raise e
 
             next_obs, reward, done, info = self.gym_env.step(zero_action)
         except RuntimeError as e:
-            print(action_delayed)
+            print(action)
             print(action)
             raise e
 
@@ -257,15 +308,28 @@ class ManiSkillEnv(BaseEnvironment):
 
         return obs, reward, done, info
 
-    def shutdown(self):
-        self.gym_env.close()
-
     def close(self):
         self.gym_env.close()
 
-    def obs_split(self, obs):
+    def obs_split(self, obs: dict) -> SceneObservation:
+        """
+        Convert the observation dict from ManiSkill to a SceneObservation.
+
+        Parameters
+        ----------
+        obs : dict
+            The observation dict from ManiSkill.
+
+        Returns
+        -------
+        SceneObservation
+            The observation in common format as a TensorClass.
+        """
         cam_obs = obs['image']
         cam_names = cam_obs.keys()
+
+        translated_names = [cam_name_tranlation[c] for c in cam_names]
+        assert set(self.cameras).issubset(set(translated_names))
 
         cam_rgb = {
             cam_name_tranlation[c]: cam_obs[c]['Color'][:, :, :3].transpose(
@@ -273,6 +337,8 @@ class ManiSkillEnv(BaseEnvironment):
             for c in cam_names
         }
 
+        # Negative depth is channel 2 in the position tensor.
+        # See https://insiders.vscode.dev/github/vonHartz/ManiSkill2/blob/main/mani_skill2/sensors/depth_camera.py#L100-L101
         cam_depth = {
             cam_name_tranlation[c]: -cam_obs[c]['Position'][:, :, 2]
             for c in cam_names
@@ -285,6 +351,7 @@ class ManiSkillEnv(BaseEnvironment):
             for c in cam_names
         }
 
+        # Invert extrinsics for consistency with RLBench, Franka. cam2world vs world2cam.
         cam_ext = {
             cam_name_tranlation[c]: np_invert_homogenous_transform(
                 obs['camera_param'][c]['extrinsic_cv'])
@@ -296,29 +363,40 @@ class ManiSkillEnv(BaseEnvironment):
             for c in cam_names
         }
 
-        ee_pose = obs['extra']['tcp_pose']
-        object_poses = {
-            k: v for k, v in obs['extra'].items() \
+        ee_pose = torch.Tensor(obs['extra']['tcp_pose'])
+        object_poses = dict_to_tensordict({
+            k: torch.Tensor(v) for k, v in obs['extra'].items()
                 if k.endswith('pose') and k != 'tcp_pose'
-        }
+        })
+
+        joint_pos = torch.Tensor(obs['agent']['qpos'])
+        joint_vel = torch.Tensor(obs['agent']['qvel'])
 
         # NOTE: the last two dims seem to be the individual fingers
-        # TODO: use avg of both?
-        joint_pose = obs['agent']['qpos']
-        joint_vel = obs['agent']['qvel']
+        joint_pos, finger_pose = joint_pos.split([7, 2])
+        joint_vel, finger_vel = joint_vel.split([7, 2])
 
-        proprio_obs = np.append(joint_pose, joint_vel)
+        multicam_obs = dict_to_tensordict(
+            {'_order': CameraOrder._create(self.cameras)} | {
+                c: SingleCamObservation(**{
+                    'rgb': torch.Tensor(cam_rgb[c]),
+                    'depth': torch.Tensor(cam_depth[c]),
+                    'mask': torch.Tensor(cam_mask[c].astype(np.uint8)).to(
+                        torch.uint8),
+                    'extr': torch.Tensor(cam_ext[c]),
+                    'intr': torch.Tensor(cam_int[c])
+            }, batch_size=empty_batchsize
+            ) for c in self.cameras
+        }
+        )
 
-        # print("ext", obs['camera_param']['base_camera']['extrinsic_cv'])
-        # print("ext", obs['camera_param']['overhead']['extrinsic_cv'])
-        # print('c2w', obs['camera_param']['base_camera']['cam2world_gl'])
-        # # print(obs['extra'].keys())
-        # print("robo", obs['agent']['base_pose'])
-        # print("obj", obs['extra']['obj_pose'])
-        # print("ee", ee_pose)
+        obs = SceneObservation(cameras=multicam_obs, ee_pose=ee_pose,
+                               object_poses=object_poses,
+                               joint_pos=joint_pos, joint_vel=joint_vel,
+                               gripper_state=finger_pose,
+                               batch_size=empty_batchsize)
 
-        return MSObservation(ee_pose, proprio_obs, object_poses,
-                             cam_rgb, cam_depth, cam_mask, cam_ext, cam_int)
+        return obs
 
 
     def get_replayed_obs(self):

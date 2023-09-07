@@ -1,16 +1,19 @@
-from rlbench.tasks import (ArmScan, CloseMicrowave, PhoneBase, PhoneOnBase,
-                           PhoneReceiver, PutRubbishInBin, TakeLidOffSaucepan)
+from collections import defaultdict
 
-task_switch = {
-    "CloseMicrowave": CloseMicrowave,
-    "TakeLidOffSaucepan": TakeLidOffSaucepan,
+from env import Environment
 
-    "PhoneOnBase": PhoneOnBase,
-    "PutRubbishInBin": PutRubbishInBin,
-    "ArmScan": ArmScan,
-
-    "PhoneBaseOnly": PhoneBase,
-    "PhoneReceiverOnly": PhoneReceiver,
+task_horizons = {
+    "CloseMicrowave": 300,  # i.e. 15 seconds
+    "TakeLidOffSaucepan": 300,
+    "PhoneOnBase": 600,
+    "PutRubbishInBin": 600,
 }
 
-tasks = list(task_switch.keys())
+task_horizons = defaultdict(lambda: 300, task_horizons)
+
+
+def get_task_horizon(config: dict) -> int | None:
+    if config["env_config"]["env"] is Environment.PANDA:
+        return None
+    else:
+        return task_horizons[config["env_config"]["task"]]

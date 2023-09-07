@@ -1,5 +1,6 @@
 import random
 from functools import cached_property, lru_cache
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -8,10 +9,13 @@ from loguru import logger
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import default_collate
 
+# NOTE: using Dataset in type annotations as replacement for SceneDataset,
+# to avoid a circular import. This is a bit hacky. TODO: fix.
+# from dataset.scene import SceneDataset
 import dense_correspondence.correspondence_augmentation as correspondence_augmentation  # noqa 501
 import dense_correspondence.correspondence_finder as correspondence_finder
-from utils.constants import MaskTypes, SampleTypes
 from utils.misc import configure_class_instance
+from utils.observation import MaskTypes, SampleTypes, SingleCamObservation
 from viz.correspondence_plotter import cross_debug_plot, debug_plots
 from viz.operations import (channel_front2back, get_image_tensor_mean,
                             get_image_tensor_std,
@@ -71,6 +75,8 @@ class DenseCorrespondenceDataset(Dataset):
                 self._data_load_types.append(data_type)
                 self._data_load_type_probabilities.append(p)
 
+        self.contrast_set = None
+
     # def get_no_obs(self):
     #     return self.scene_data.no_obs
 
@@ -89,10 +95,10 @@ class DenseCorrespondenceDataset(Dataset):
         else:
             labels = self.scene_data.object_labels
 
-        if self.config.get("only_use_labels"):
-            label_subset = self.config["only_use_labels"]
+        if label_subset := self.config.get("only_use_labels"):
             for l in label_subset:
                 assert l in labels, f"Label {l} not in dataset."
+            logger.info(f"Only using labels {label_subset}")
             labels = label_subset
 
         return labels
@@ -135,7 +141,7 @@ class DenseCorrespondenceDataset(Dataset):
 
     @cached_property
     def no_cams(self):
-        return len(self.config["cams"])
+        return len(self.config["cameras"])
 
     @cached_property
     def _len(self):
@@ -155,12 +161,16 @@ class DenseCorrespondenceDataset(Dataset):
         else:
             raise ValueError("Unexpected sample type {}.".format(t))
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int):
         return self._getitem(index, self.sample_type,
-                             cams=self.config["cams"],
+                             cams=self.config["cameras"],
                              contr_cams=self.config["contr_cam"])
 
-    def _getitem(self, index, sample_type, cams=None, contr_cams=None):
+    def _getitem(self, index: int, sample_type: SampleTypes,
+                 cams: tuple[str] | None = None,
+                 contr_cams: tuple[str] | None = None
+                 ) -> tuple | torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+
         if cams is None:
             cams = ("wrist",)
         if contr_cams is None:
@@ -168,6 +178,7 @@ class DenseCorrespondenceDataset(Dataset):
 
         if sample_type is SampleTypes.DC:
             traj_idx, img_idx = self.scene_data._index_split(index)
+
             return self.sample_dc(cams, contr_cams,
                                   traj_idx=traj_idx, img_idx=img_idx)
 
@@ -175,6 +186,7 @@ class DenseCorrespondenceDataset(Dataset):
             cam_idx, obs_idx = index // self.no_obs, index % self.no_obs
             traj_idx, img_idx = self.scene_data._index_split(obs_idx)
             cam = cams[cam_idx]
+
             return self.sample_camera_single(traj_idx, img_idx, cam=cam)
 
         elif sample_type is SampleTypes.CAM_PAIR:
@@ -185,6 +197,7 @@ class DenseCorrespondenceDataset(Dataset):
             traj_idx2, img_idx2 = self.scene_data._index_split(index2)
             cam1 = cams[cam_idx1]
             cam2 = cams[cam_idx2]
+
             return self.sample_camera_pair(
                 traj_idx1, img_idx1, cam1, traj_idx2, img_idx2, cam2)
 
@@ -206,7 +219,9 @@ class DenseCorrespondenceDataset(Dataset):
         else:
             raise ValueError("Unexpected sample type {}.".format(t))
 
-    def sample_camera_single(self, traj_idx=None, img_idx=None, cam="wrist"):
+    def sample_camera_single(self, traj_idx: int | None = None,
+                             img_idx: int | None = None, cam: str = "wrist"
+                             ) -> torch.Tensor:
 
         kwargs = {"mask_type": None, "raw_mask": True,
                   "collapse_labels": False, "labels": None,
@@ -219,10 +234,13 @@ class DenseCorrespondenceDataset(Dataset):
         obs = self.scene_data.get_observation(
             traj_idx=traj_idx, img_idx=img_idx, cam=cam, **kwargs)
 
-        return obs.cam_rgb
+        return obs.rgb
 
-    def sample_camera_pair(self, traj_idx1=None, img_idx1=None, cam1="wrist",
-                           traj_idx2=None, img_idx2=None, cam2="wrist"):
+    def sample_camera_pair(self, traj_idx1: int | None = None,
+                           img_idx1: int | None = None, cam1: str = "wrist",
+                           traj_idx2: int | None = None,
+                           img_idx2: int | None = None, cam2: str = "wrist"
+                           ) -> tuple[torch.Tensor, torch.Tensor]:
 
         kwargs = {"mask_type": None, "raw_mask": True,
                   "collapse_labels": False, "labels": None,
@@ -238,9 +256,10 @@ class DenseCorrespondenceDataset(Dataset):
         obs2 = self.scene_data.get_observation(
             traj_idx=traj_idx2, img_idx=img_idx2, cam=cam2, **kwargs)
 
-        return obs1.cam_rgb, obs2.cam_rgb
+        return obs1.rgb, obs2.rgb
 
-    def sample_dc(self, cams, contr_cam, traj_idx=None, img_idx=None):
+    def sample_dc(self, cams: tuple[str], contr_cam: tuple[str] | None,
+                   traj_idx: int, img_idx: int) -> tuple:
         """
         Randomly chooses one of our different img pair types and camera conf,
         then returns that type of data.
@@ -260,10 +279,11 @@ class DenseCorrespondenceDataset(Dataset):
 
         # Case 1: Same object, different scene
         elif data_load_type == DcDatasetDataType.SINGLE_OBJECT_ACROSS_SCENE:
-            if self._verbose:
-                logger.info("Same object, different scene")
-            return self.get_single_object_across_scene_data(
-                cam_a=cam_a, cam_b=cam_b, traj_idx=traj_idx, img_idx=img_idx)
+            raise NotImplementedError
+            # if self._verbose:
+            #     logger.info("Same object, different scene")
+            # return self.get_single_object_across_scene_data(
+            #     cam_a=cam_a, cam_b=cam_b, traj_idx=traj_idx, img_idx=img_idx)
 
         # Case 2: Different object
         elif data_load_type == DcDatasetDataType.DIFFERENT_OBJECT:
@@ -299,8 +319,9 @@ class DenseCorrespondenceDataset(Dataset):
         return np.random.choice(
             self._data_load_types, 1, p=self._data_load_type_probabilities)[0]
 
-    def get_single_object_within_scene_data(self, cam_a, cam_b,
-                                            traj_idx=None, img_idx=None):
+    def get_single_object_within_scene_data(self, cam_a: str, cam_b: str,
+                                            traj_idx: int, img_idx: int
+                                            ) -> tuple:
         """
         Simple wrapper around get_within_scene_data(), for the single object
         case.
@@ -313,16 +334,16 @@ class DenseCorrespondenceDataset(Dataset):
                            "Is that intended?")
             object_no = 0  # HACK for Lid to always pick lid_label
             object_label = self.object_labels[object_no]
-            object_label = [object_label]
+            object_labels = [object_label]
         elif self.config.get('conflate_so_object_labels'):
             logger.warning("Conflating object labels instead of sample.  "
                            "Is that intended? "
                            "Should only be needed for GT-masks and SO scenes.")
             object_no = 0  # HACK for Lid to use same pose for both objects
-            object_label = self.object_labels
+            object_labels = self.object_labels
         else:
             object_no, object_label = self.get_random_object_label()
-            object_label = [object_label]
+            object_labels = [object_label]
 
         # TODO: make this confble?
 
@@ -337,12 +358,12 @@ class DenseCorrespondenceDataset(Dataset):
         }
 
         return self.get_within_scene_data(traj_idx=traj_idx, img_idx=img_idx,
-                                          object_label=object_label,
+                                          object_labels=object_labels,
                                           metadata=metadata, cam_a=cam_a,
                                           cam_b=cam_b, object_no=object_no)
 
-    def get_different_object_data(self, cam_a, cam_b,
-                                  traj_idx=None, img_idx=None):
+    def get_different_object_data(self, cam_a: str, cam_b: str,
+                                  traj_idx: int, img_idx: int) -> tuple:
         """
         Simple wrapper around get_within_scene_data(), for the multi object
         case
@@ -356,7 +377,7 @@ class DenseCorrespondenceDataset(Dataset):
         traj_idx_a = traj_idx
         img_idx_a = img_idx
 
-        if not hasattr(self, "contrast_set"):
+        if self.contrast_set is None:
             raise AttributeError(
                 "Need contrast set for different object sample.")
 
@@ -374,8 +395,9 @@ class DenseCorrespondenceDataset(Dataset):
             object_label_a=object_label_a, object_label_b=object_label_b,
             set_b=self.contrast_set.scene_data, metadata=metadata)
 
-    def get_multi_object_within_scene_data(self, cam_a, cam_b,
-                                           traj_idx=None, img_idx=None):
+    def get_multi_object_within_scene_data(self, cam_a: str, cam_b: str,
+                                           traj_idx: int, img_idx: int
+                                           ) -> tuple:
         """
         Simple wrapper around get_within_scene_data(), for the multi object
         case
@@ -392,7 +414,7 @@ class DenseCorrespondenceDataset(Dataset):
         # Need to verify that this works for other tasks as well and fix if
         # needed.
         object_no, object_label = self.get_random_object_label()
-        object_label = [object_label]
+        object_labels = [object_label]
 
         # traj_idx = traj_idx or self.sample_traj_idx()
         # img_idx = img_idx or self.sample_img_idx(traj_idx)
@@ -407,14 +429,17 @@ class DenseCorrespondenceDataset(Dataset):
         # training besides the number of object masks to sample from.
 
         return self.get_within_scene_data(traj_idx=traj_idx, img_idx=img_idx,
-                                          object_label=object_label,
+                                          object_labels=object_labels,
                                           metadata=metadata, cam_a=cam_a,
                                           cam_b=cam_b, object_no=object_no)
 
-    def get_dc_obs(self, traj_idx, img_idx, object_labels=1, cam="wrist",
-                   dataset=None):
+    def get_dc_obs(self, traj_idx: int, img_idx: int,
+                   object_labels: Iterable[int] | None = (1, ),
+                   cam: str = "wrist", dataset: Dataset | None = None
+                   ) -> SingleCamObservation:
         if dataset is None:
             dataset = self.scene_data
+
         obs = dataset.get_observation(
             traj_idx=traj_idx, img_idx=img_idx,
             cam=cam, mask_type=self.config["mask_type"], raw_mask=False,
@@ -423,11 +448,15 @@ class DenseCorrespondenceDataset(Dataset):
             get_action=False, get_feedback=False, get_gripper_pose=False,
             get_object_pose=self.config["use_object_pose"],
             get_proprio_obs=False, get_wrist_pose=False)
+
         return obs
 
-    def get_ext(self, traj_idx, img_idx, cam="wrist", dataset=None):
+    def get_ext(self, traj_idx: int, img_idx: int, cam: str = "wrist",
+                dataset: Dataset = None) -> SingleCamObservation:
+
         if dataset is None:
             dataset = self.scene_data
+
         obs = dataset.get_observation(
             traj_idx=traj_idx, img_idx=img_idx,
             cam=cam, mask_type=self.config["mask_type"], raw_mask=False,
@@ -436,17 +465,21 @@ class DenseCorrespondenceDataset(Dataset):
             get_action=False, get_feedback=False, get_gripper_pose=False,
             get_object_pose=self.config["use_object_pose"],
             get_proprio_obs=False, get_wrist_pose=False)
-        return obs.cam_ext
 
-    def get_within_scene_data(self, traj_idx, img_idx, object_label,
-                              cam_a="wrist", cam_b="wrist", object_no=None,
-                              metadata=None, for_synthetic_multi_object=False,
-                              dataset=None):
+        return obs.extr
+
+    def get_within_scene_data(self, traj_idx: int, img_idx: int,
+                              object_labels: list[int], cam_a: str = "wrist",
+                              cam_b: str = "wrist",
+                              object_no: int | None = None,
+                              metadata: dict = None,
+                              for_synthetic_multi_object: bool = False,
+                              dataset: Dataset | None = None) -> tuple:
 
         if dataset is None:
             dataset = self.scene_data
 
-        obs_a = self.get_dc_obs(traj_idx, img_idx, object_labels=object_label,
+        obs_a = self.get_dc_obs(traj_idx, img_idx, object_labels=object_labels,
                                 cam=cam_a, dataset=dataset)
 
         # Get a second frame which is 'different enough' from the first one.
@@ -462,24 +495,26 @@ class DenseCorrespondenceDataset(Dataset):
             pose_for_pose_dif = self.get_ext(traj_idx, img_idx, cam="wrist")
             cam_for_pose_dif = "wrist"
         else:
-            pose_for_pose_dif = obs_a.cam_ext
+            pose_for_pose_dif = obs_a.extr
             cam_for_pose_dif = cam_b
+
         image_b_idx = dataset.get_img_idx_with_different_pose(
             traj_idx, pose_for_pose_dif, num_attempts=50, cam=cam_for_pose_dif)
 
         metadata['image_b_idx'] = image_b_idx
+
         if image_b_idx is None:
             if self._verbose:
                 logger.info("No frame with sufficiently different pose found,"
                             " returning.")
             if for_synthetic_multi_object:
                 return self.return_empty_data_for_smo(
-                    obs_a.cam_rgb, obs_a.cam_rgb)
+                    obs_a.rgb, obs_a.rgb)
             else:
-                return self.return_empty_data(obs_a.cam_rgb, obs_a.cam_rgb)
+                return self.return_empty_data(obs_a.rgb, obs_a.rgb)
 
         obs_b = self.get_dc_obs(traj_idx, image_b_idx,
-                                object_labels=object_label, cam=cam_b,
+                                object_labels=object_labels, cam=cam_b,
                                 dataset=dataset)
 
         if self.sample_matches_only_off_mask:
@@ -489,22 +524,21 @@ class DenseCorrespondenceDataset(Dataset):
 
         # find correspondences
         uv_a, uv_b = correspondence_finder.batch_find_pixel_correspondences(
-            obs_a.cam_d, obs_a.cam_ext, obs_b.cam_d, obs_b.cam_ext,
+            obs_a.depth, obs_a.extr, obs_b.depth, obs_b.extr,
             img_a_mask=correspondence_mask,
             num_attempts=self.num_matching_attempts,
-            K_a=obs_a.cam_int, K_b=obs_b.cam_int,
+            K_a=obs_a.intr, K_b=obs_b.intr,
             obj_pose_a=obs_a.object_poses, obj_pose_b=obs_b.object_poses,
             object_no=object_no)
 
         if for_synthetic_multi_object:
-            return obs_a.cam_rgb, obs_b.cam_rgb, obs_a.cam_d, obs_b.cam_d, \
+            return obs_a.rgb, obs_b.rgb, obs_a.depth, obs_b.depth, \
                 obs_a.mask, obs_b.mask, uv_a, uv_b
 
         if uv_a is None:
             if self._verbose:
                 logger.info("No matches found, returning.")
-            return self.return_empty_data(obs_a.cam_rgb,
-                                          obs_a.cam_rgb)  # TODO: obs_b?
+            return self.return_empty_data(obs_a.rgb, obs_a.rgb)
 
         image_a_rgb, image_a_mask, image_a_depth, image_b_rgb, image_b_mask, \
             image_b_depth, uv_a, uv_b = self._image_augment(obs_a, obs_b,
@@ -513,7 +547,7 @@ class DenseCorrespondenceDataset(Dataset):
         if uv_a is None:
             if self._verbose:
                 logger.info("No matches left after image augment, returning.")
-            return self.return_empty_data(obs_a.cam_rgb, obs_b.cam_rgb)
+            return self.return_empty_data(obs_a.rgb, obs_b.rgb)
 
         # find non_correspondences
         image_b_shape = image_b_depth.shape
@@ -563,7 +597,7 @@ class DenseCorrespondenceDataset(Dataset):
         if uv_b_masked_non_matches_long is None:
             if self._verbose:
                 logger.info("No masked non-matches found, returning.")
-            return self.return_empty_data(obs_a.cam_rgb, obs_b.cam_rgb)
+            return self.return_empty_data(obs_a.rgb, obs_b.rgb)
             # masked_non_matches_b = None
         else:
             masked_non_matches_b = self.flatten_uv_tensor(
@@ -582,7 +616,7 @@ class DenseCorrespondenceDataset(Dataset):
         if background_non_matches_b is None:
             if self._verbose:
                 logger.info("No background non-matches found, returning.")
-            return self.return_empty_data(obs_a.cam_rgb, obs_b.cam_rgb)
+            return self.return_empty_data(obs_a.rgb, obs_b.rgb)
         else:
             background_non_matches_b = background_non_matches_b.squeeze(1)
 
@@ -674,7 +708,7 @@ class DenseCorrespondenceDataset(Dataset):
                 obs_b.mask, num_samples)
 
         if (blind_uv_a[0] is None) or (blind_uv_b[0] is None):
-            return self.return_empty_data(obs_a.cam_rgb, obs_a.cam_rgb)
+            return self.return_empty_data(obs_a.rgb, obs_a.rgb)
 
         image_a_rgb, _, image_a_depth, image_b_rgb, _,  image_b_depth, \
             blind_uv_a, blind_uv_b = self._image_augment(
@@ -700,7 +734,8 @@ class DenseCorrespondenceDataset(Dataset):
             empty_tensor, blind_uv_a_flat, blind_uv_b_flat, metadata
 
     def get_synthetic_multi_object_within_scene_data(
-            self, cam_a, cam_b, traj_idx=None, img_idx=None):
+            self, cam_a: str, cam_b: str, traj_idx: int | None = None,
+            img_idx: int | None = None) -> tuple:
 
         if self.scene_data.smo_order is None:
             dataset_keys = list(self.scene_data.smo_data.keys())
@@ -722,8 +757,14 @@ class DenseCorrespondenceDataset(Dataset):
             "type": DcDatasetDataType.SYNTHETIC_MULTI_OBJECT,
         }
 
-        traj_idx_a = dataset_a.sample_traj_idx()
-        img_idx_a = dataset_a.sample_img_idx(traj_idx_a)
+        if self.scene_data.smo_order is None or traj_idx is None:
+            traj_idx_a = dataset_a.sample_traj_idx()
+        else:
+            traj_idx_a = traj_idx
+        if self.scene_data.smo_order is None or img_idx is None:
+            img_idx_a = dataset_a.sample_img_idx(traj_idx_a)
+        else:
+            img_idx_a = img_idx
         traj_idx_b = dataset_b.sample_traj_idx()
         img_idx_b = dataset_b.sample_img_idx(traj_idx_b)
 
@@ -841,8 +882,15 @@ class DenseCorrespondenceDataset(Dataset):
 
         background_non_matches_a = self.flatten_uv_tensor(
             uv_a_background_long, image_width).squeeze(1)
-        background_non_matches_b = self.flatten_uv_tensor(
-            uv_b_background_non_matches_long, image_width).squeeze(1)
+
+        if uv_b_background_non_matches_long is None:
+            if self._verbose:
+                logger.info("No masked non-matches found, returning.")
+            return self.return_empty_data(image_a1_rgb, image_b1_rgb)
+            # masked_non_matches_b = None
+        else:
+            background_non_matches_b = self.flatten_uv_tensor(
+                uv_b_background_non_matches_long, image_width).squeeze(1)
 
         blind_non_matches_a = self.empty_tensor()
         blind_non_matches_b = self.empty_tensor()
@@ -870,12 +918,12 @@ class DenseCorrespondenceDataset(Dataset):
             blind_non_matches_a, blind_non_matches_b, metadata
 
     def _image_augment(self, obs_a, obs_b, uv_a, uv_b):
-        image_a_rgb = obs_a.cam_rgb
+        image_a_rgb = obs_a.rgb
         image_a_mask = obs_a.mask
-        image_a_depth = obs_a.cam_d
-        image_b_rgb = obs_b.cam_rgb
+        image_a_depth = obs_a.depth
+        image_b_rgb = obs_b.rgb
         image_b_mask = obs_b.mask
-        image_b_depth = obs_b.cam_d
+        image_b_depth = obs_b.depth
 
         if self.domain_randomize:
             image_a_rgb = \
@@ -1003,10 +1051,15 @@ class DenseCorrespondenceDataset(Dataset):
         image_flat[uv_flat_tensor] = 1
         return image_flat
 
-    def sample_single_image(self, cam="wrist",
-                            dataset=None, traj_idx=None, img_idx=None):
+    def sample_single_image(self, cameras: tuple[str] = ("wrist", ),
+                            dataset: Dataset | None = None,
+                            traj_idx: int | None = None,
+                            img_idx: int | None = None
+                            ) -> SingleCamObservation:
+
         traj_idx = traj_idx or self.sample_traj_idx()
         img_idx = img_idx or self.scene_data.sample_img_idx(traj_idx)
+        cam = random.choice(cameras)
 
         if dataset is None:
             dataset = self.scene_data
@@ -1018,25 +1071,38 @@ class DenseCorrespondenceDataset(Dataset):
             get_action=False, get_feedback=False, get_gripper_pose=False,
             get_object_pose=False, get_proprio_obs=False, get_wrist_pose=False)
 
-        return obs.cam_rgb
+        return obs.rgb
 
-    def sample_image_tensor(self, no_samples, cam="wrist"):
-        imgs = [self.sample_single_image(cam=cam) for _ in range(no_samples)]
+    def sample_image_tensor(self, no_samples: int,
+                            cameras: tuple[str] = ("wrist", )
+                            ) -> torch.FloatTensor:
+        imgs = [self.sample_single_image(cameras=cameras)
+                for _ in range(no_samples)]
 
         return torch.stack(imgs)
 
-    def estimate_image_mean_and_std(self, num_image_samples=10, cam="wrist"):
+    def estimate_image_mean_and_std(
+            self, num_image_samples: int = 10, cam: tuple[str] = ("wrist",)
+            ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         """
         Estimate the image_mean and std_dev by sampling from scene images.
         Returns two torch.FloatTensor objects, each of size [3]
-        :param num_image_samples:
-        :type num_image_samples:
-        :return:
-        :rtype:
+
+        Parameters
+        ----------
+        num_image_samples : int, optional
+            Number of samples, by default 10
+        cam : tuple[str], optional
+            The cameras to sample from, by default ("wrist", )
+
+        Returns
+        -------
+        tuple[torch.FloatTensor, torch.FloatTensor]
+            Sample mean and std_dev.
         """
 
         # have channel in front now, so keep dim -3
-        samples = self.sample_image_tensor(num_image_samples, cam=cam)
+        samples = self.sample_image_tensor(num_image_samples, cameras=cam)
         sample_mean = get_image_tensor_mean(samples, dims_to_keep=(-3,))
         sample_std = get_image_tensor_std(samples, dims_to_keep=(-3,))
 
@@ -1075,7 +1141,7 @@ class DenseCorrespondenceDataset(Dataset):
                 image_b_idx = self.sample_img_idx(traj_idx)
             else:
                 image_b_idx = self.scene_data.get_img_idx_with_different_pose(
-                    traj_idx, obs_a.cam_ext, num_attempts=50)
+                    traj_idx, obs_a.extr, num_attempts=50)
 
             obs_b = self.scene_data.get_observation(
                 traj_idx=traj_idx, img_idx=image_b_idx, cam=cam_b, **kwargs)

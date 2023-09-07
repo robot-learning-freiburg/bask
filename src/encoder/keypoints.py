@@ -1,7 +1,7 @@
 from enum import Enum
+from typing import Iterable
 
 import numpy as np
-# import math
 import torch
 import torchvision
 import tqdm
@@ -12,17 +12,19 @@ import encoder.representation_learner
 import models.keypoints.keypoints as keypoints
 import models.keypoints.model_based_vision as model_based_vision
 import wandb
+from dataset.bc import BCDataset
 from dense_correspondence.correspondence_finder import \
     random_sample_from_masked_image_torch
 from dense_correspondence.loss.pixelwise_contrastive_loss import \
     PixelwiseContrastiveLoss
-from particle_filter.filter import ParticleFilter
-from utils.constants import SampleTypes
-from utils.select_gpu import device
+from filter.discrete_filter import DiscreteFilter
+from filter.particle_filter import ParticleFilter
 # from utils.debug import nan_hook, summarize_tensor
-from utils.torch import append_depth_to_uv  # batched_project_onto_cam,
-from utils.torch import (batched_pinhole_projection_image_to_world_coordinates,
-                         batched_project_onto_cam, hard_pixels_to_3D_world,
+from utils.logging import indent_func_log, log_constructor
+from utils.misc import get_and_log_failure as get_conf
+from utils.observation import SampleTypes, tensor_dict_equal
+from utils.select_gpu import device
+from utils.torch import (append_depth_to_uv, hard_pixels_to_3D_world,
                          heatmap_from_pos)
 # from viz.image_series import vis_series
 from viz.image_single import image_with_points_overlay_uv_list
@@ -35,10 +37,8 @@ KeypointsTypes = keypoints.KeypointsTypes
 
 class PriorTypes(Enum):
     NONE = 1
-    POS_GAUSS = 2
-    POS_UNI = 3
-    DISCRETE_FILTER = 4
-    PARTICLE_FILTER = 5
+    DISCRETE_FILTER = 2
+    PARTICLE_FILTER = 3
 
 
 class ProjectionTypes(Enum):
@@ -59,61 +59,65 @@ class LRScheduleTypes(Enum):
     COSINE_WR = 4
 
 
+class KeypointModelModes(Enum):
+    ...
+
+
 class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
     sample_type = SampleTypes.DC
 
-    def __init__(self, config=None):  # , image_size=None):
+    encoding_name = 'kp'
+
+    @log_constructor
+    def __init__(self, config: dict):
+        # TODO: set disk_read_embedding and disk_read_keypoints, organize into
+        # subfuncs and only execute what is needed depending on the two flags.
         super().__init__(config=config)
 
-        optional_keys = ["overshadow_keypoints", "threshold_keypoint_dist",
-                         "prior_type", "taper_sm",
-                         "use_motion_model", "motion_model_noisy"]
+        self.disk_read_keypoints = get_conf(config["obs_config"],
+                                            "disk_read_keypoints", False)
 
-        optional_keys_training = ["manual_kp_selection", "lr_schedule"]
+        if self.disk_read_keypoints:
+            logger.info("Reading precomputed keypoints from disk.")
 
         encoder_config = config["encoder"]
         self.config = encoder_config
 
-        for k in optional_keys:
-            if k not in encoder_config:
-                logger.warning(
-                    "Key {} not in encoder config. Assuming False.", k)
+        self.configure_dc_maps(config)
 
-        # if image_size is None:
-        #     image_size = (256, 256)
-        image_size = config["obs_config"]["image_dim"]
-
-        KeypointsPredictor.image_height, KeypointsPredictor.image_width = \
-            image_size
-
-        self.get_dc_dim()
-
+        # Required keys
         self.descriptor_dimension = encoder_config["descriptor_dim"]
-        self.keypoint_dimension = 2 if encoder_config["projection"] is \
-            ProjectionTypes.NONE else 3
-        self.use_spatial_expectation = encoder_config["use_spatial_expectation"]  # noqa 402
+
+        # Optional keys
+        self.noise_scale = get_conf(encoder_config, "noise_scale", None)
+        self.prior_type = get_conf(encoder_config, "prior_type",
+                                   PriorTypes.NONE)
+        self.overshadow = get_conf(encoder_config, "overshadow_keypoints",
+                                   False)
+        self.threshold = get_conf(encoder_config, "threshold_keypoint_dist",
+                                  False)
+        self.taper = get_conf(encoder_config, "taper_sm", 1)
+        self.use_spatial_expectation = get_conf(
+            encoder_config, "use_spatial_expectation", False)
+        self.debug_kp_selection = get_conf(config["training"], "debug", False)
+
+        self.projection = get_conf(encoder_config, "projection", False)
+
+        self.keypoint_dimension = 2 if self.projection is ProjectionTypes.NONE\
+             else 3
 
         self.model = keypoints.KeypointsModel(encoder_config)
-
-        self.debug_kp_selection = config["training"]["debug"]
-
-        if encoder_config.get('motion_model_noisy'):
-            self.motion_blur = torchvision.transforms.GaussianBlur(
-                kernel_size=encoder_config["motion_model_kernel"],
-                sigma=encoder_config["motion_model_sigma"])
-        else:
-            self.motion_blur = None
 
         pretrain_config = config.get("pretrain", {}).get("training_config", {})
 
         if pretrain_config is not None:
             logger.info("Got pretrain config. Setting up DC-learning.")
             self.pretrain_config = pretrain_config
-            for k in optional_keys_training:
-                if k not in pretrain_config:
-                    logger.warning(
-                        "Key {} not in pretrain config. Assuming False.", k)
+
+            self.manual_kp_selection = get_conf(
+                pretrain_config, "manual_kp_selection", False)
+            self.lr_schedule = get_conf(pretrain_config, "lr_schedule", None)
 
             self.loss = PixelwiseContrastiveLoss(
                 image_shape=(self.image_height, self.image_width),
@@ -149,10 +153,9 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
             logger.info(
                 "Got no pretrain config. Encoder is in policy-learning mode.")
 
-        n_keypoints = self.get_no_keypoints()
-
-        # Register keypoints as buffers, such that they will be saved with the
+        # Register references as buffers, such that they will be saved with the
         # module. Then, we can use the same reference vectors at inference.
+        n_keypoints = self.get_no_keypoints()
         self.register_buffer('ref_pixels_uv',
                              torch.Tensor(2, n_keypoints))
         self.register_buffer('_reference_descriptor_vec',
@@ -162,35 +165,52 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         self.register_buffer('norm_mean', torch.Tensor(3))
         self.register_buffer('norm_std', torch.Tensor(3))
 
+        if self.prior_type is PriorTypes.PARTICLE_FILTER:
+            self.filter = ParticleFilter(config)
+            self.filter_viz = None
+            # if self.debug_kp_selection:
+            #     self.filter_viz = ParticleFilterViz()
+            #     self.filter_viz.run()
+        elif self.prior_type is PriorTypes.DISCRETE_FILTER:
+            self.filter = DiscreteFilter(config)
+            self.filter_viz = None
+        else:
+            self.filter = None
+            self.filter_viz = None
+
+        self.reset_episode()
+
+    def configure_dc_maps(self, config: dict):
+        self.image_height, self.image_width = config["obs_config"]["image_dim"]
+        self.dc_height, self.dc_width = self.get_dc_dim()
         self.setup_pixel_maps()
 
-        if self.config.get("prior_type", PriorTypes.NONE) is \
-                PriorTypes.PARTICLE_FILTER:
-            self.particle_filter = ParticleFilter(config)
-            self.particle_filter_viz = None
-            # if self.debug_kp_selection:
-            #     self.particle_filter_viz = ParticleFilterViz()
-            #     self.particle_filter_viz.run()
-        else:
-            self.particle_filter = None
-            self.particle_filter_viz = None
+        # self.config = config
 
-        self.reset_traj()
+    def get_dc_dim(self):
+        dim_mapping = {128: 32,
+                       256: 32,
+                       360: 45,
+                       480: 60,
+                       640: 80}
 
-    def reset_traj(self):
-        self.last_kp_raw_2d = None
+        return dim_mapping[self.image_height], dim_mapping[self.image_width]
 
-        self.last_post = None
+    def setup_pixel_maps(self):
+        pos_x, pos_y = np.meshgrid(
+            np.linspace(-1., 1., self.dc_width),
+            np.linspace(-1., 1., self.dc_height)
+        )
 
-        self.last_d = None
-        self.last_int = None
-        self.last_ext = None
+        self.pos_x = torch.from_numpy(pos_x).float().to(device)
+        self.pos_y = torch.from_numpy(pos_y).float().to(device)
 
-        if self.particle_filter is not None:
-            self.particle_filter.reset()
 
-        if self.particle_filter_viz is not None:
-            self.particle_filter_viz.reset_traj()
+    def reset_episode(self):
+        if self.filter is not None:
+            self.filter.reset()
+        if self.filter_viz is not None:
+            self.filter_viz.reset_episode()
 
     def get_no_keypoints(self):
         keypoint_type = self.config["keypoints"]["type"]
@@ -203,21 +223,15 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         return n_keypoints
 
-    @classmethod
-    def get_dc_dim(cls):
-        dim_mapping = {128: 32,
-                       256: 32,
-                       480: 60,
-                       640: 80}
-        cls.dc_height = dim_mapping[cls.image_height]
-        cls.dc_width = dim_mapping[cls.image_width]
-
     def update_params(self, batch, dataset_size=None, batch_size=None,
                       **kwargs):
         loss, match_loss, masked_non_match_loss, \
             background_non_match_loss, blind_non_match_loss, \
             descriptor_distances = \
             self.process_batch(batch, batch_size=batch_size, train=True)
+
+        if loss is None:
+            return None
 
         training_metrics = {
             "train-loss": loss,
@@ -229,6 +243,7 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
             }
         descriptor_distances = {"train-" + k: wandb.Histogram(v) for k,
                                 v in descriptor_distances.items()}
+
         training_metrics.update(descriptor_distances)
 
         return training_metrics
@@ -239,6 +254,9 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
             descriptor_distances = \
             self.process_batch(batch, batch_size=batch_size, train=False)
 
+        if loss is None:
+            return None
+
         eval_metrics = {
             "eval-loss": loss,
             "eval-match_loss": match_loss,
@@ -248,7 +266,9 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
             }
         descriptor_distances = {"eval-" + k: wandb.Histogram(v) for k,
                                 v in descriptor_distances.items()}
+
         eval_metrics.update(descriptor_distances)
+
         return eval_metrics
 
     def process_batch(self, batch, batch_size=None, train=False):
@@ -323,6 +343,9 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
             self.optimizer.step()
             self.scheduler.step()
 
+        if not list_loss:  # empty list
+            return [None] * 6
+
         return torch.mean(torch.stack(list_loss)), \
             torch.mean(torch.stack(list_match_loss)), \
             torch.mean(torch.stack(list_masked_non_match_loss)), \
@@ -347,101 +370,63 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         H = self.image_height
         image_pred = image_pred.view(N, self.descriptor_dimension, W * H)
         image_pred = image_pred.permute(0, 2, 1)
+
         return image_pred
 
-    def encode(self, camera_obs, full_obs=None):
-        # TODO: can easily get rid of the separate camera_obs?
-        # TODO: already setup _encoder to work with tuples, ie arbitary number
-        # of cameras. Might wanna restructure this here as well.
+    def encode(self, batch):
 
-        if hasattr(full_obs, "cam_rgb2"):
-            n_cams = 1 if full_obs.cam_rgb2 is None else 2
+        if self.disk_read_keypoints:
+            return getattr(batch, self.encoding_name), {}
+
+        camera_obs = batch.camera_obs
+
+        rgb = tuple((o.rgb for o in camera_obs))
+        depth = tuple((o.depth for o in camera_obs))
+        extr = tuple((o.extr for o in camera_obs))
+        intr = tuple((o.intr for o in camera_obs))
+
+        n_cams = len(rgb)
+
+        if self.disk_read_embedding:
+           descriptor = tuple((o.descriptor for o in camera_obs))
         else:
-            n_cams = 1
+            descriptor = tuple(self.compute_descriptor_batch(r, upscale=False)
+                            for r in rgb)
 
-        # TODO: set to None in constructor to remove hasattr check.
-        if hasattr(full_obs, "cam_rgb2") and full_obs.cam_rgb2 is not None:
-            rgb = (camera_obs, full_obs.cam_rgb2)
-            depth = (full_obs.cam_d, full_obs.cam_d2)
-            extr = (full_obs.cam_ext, full_obs.cam_ext2)
-            intr = (full_obs.cam_int, full_obs.cam_int2)
-        else:
-            rgb = (camera_obs, )
-            depth = (full_obs.cam_d, )
-            extr = (full_obs.cam_ext, )
-            intr = (full_obs.cam_int, )
 
-        descriptor = tuple(self.compute_descriptor_batch(r, upscale=False)
-                           for r in rgb)
-
-        if self.config.get("prior_type", PriorTypes.NONE) is \
-                PriorTypes.PARTICLE_FILTER:
-            self.particle_filter.update(
+        if self.prior_type is PriorTypes.PARTICLE_FILTER:
+            self.filter.update(
                 rgb, depth, extr, intr, descriptor=descriptor,
                 ref_descriptor=self._reference_descriptor_vec,
-                gripper_pose=full_obs.gripper_pose)
-            kp, info = self.particle_filter.estimate_state(extr, intr, depth)
-            # print(torch.stack(torch.chunk(kp, 3, dim=-1), dim=-1))
+                gripper_pose=batch.ee_pose)
+            kp, info = self.filter.estimate_state(extr, intr, depth)
 
-            if self.particle_filter_viz is not None:
-                self.particle_filter_viz.update(info['particles'],
-                                                info['weights'],
-                                                info['prediction'],
-                                                info['particles_2d'],
-                                                info['keypoints_2d'],
-                                                tuple(r.cpu() for r in rgb))
-
+            if self.filter_viz is not None:
+                self.filter_viz.update(info['particles'],
+                                       info['weights'],
+                                       info['prediction'],
+                                       info['particles_2d'],
+                                       info['keypoints_2d'],
+                                       tuple(r.cpu() for r in rgb))
         else:
-            prior = tuple(self.get_prior(
-                prior_sm=None if (l := self.last_post) is None else l[i],
-                prior_pos=None if (l := self.last_kp_raw_2d) is None else l[i])
-                        for i in range(n_cams))
-
-            motion_model = tuple(
-                self.get_motion_model(
-                    depth[i], intr[i], extr[i],
-                    None if (l := self.last_d) is None else l[i],
-                    None if (l := self.last_int) is None else l[i],
-                    None if (l := self.last_ext) is None else l[i])
-                for i in range(n_cams))
-
-            # if motion_model is not None:
-            #     vis_series(prior[0].cpu(), channeled=False,
-            #     file_name="prior")
-
-            prior = tuple(self.apply_motion_model(prior[i], motion_model[i])
-                          for i in range(n_cams))
-
-            # if motion_model is not None:
-            #     vis_series(prior[0].cpu(), channeled=False,
-            #     file_name="prior_mm")
-
-            overshadow = self.config.get("overshadow_keypoints")
-            threshold = self.config.get("threshold_keypoint_dist")
-
-            taper = self.config.get("taper_sm") or 1
-            use_spatial_expectation = self.config["use_spatial_expectation"]
-            projection = self.config["projection"]
+            if self.prior_type is PriorTypes.DISCRETE_FILTER:
+                prior = self.filter.get_prior(rgb, depth, extr, intr)
+            else:
+                prior = tuple((None for _ in range(n_cams)))
 
             kp, info = self._encode(
                 rgb, depth, extr, intr, prior, descriptor=descriptor,
                 ref_descriptor=self._reference_descriptor_vec,
-                use_spatial_expectation=use_spatial_expectation, taper=taper,
-                projection=projection, overshadow=overshadow,
-                threshold=threshold)
+                use_spatial_expectation=self.use_spatial_expectation,
+                projection=self.projection, overshadow=self.overshadow,
+                threshold=self.threshold, taper=self.taper)
 
-        self.last_kp_raw_2d = info["kp_raw_2d"]
-        self.last_post = info["post"]
-        self.last_d = depth
-        self.last_int = intr
-        self.last_ext = extr
-
-        # print(kp)
+        if self.noise_scale is not None:
+            kp = self.add_gaussian_noise(kp, self.noise_scale, skip_z=False)
 
         return kp, info
 
-    @classmethod
-    def _encode(cls, rgb, depth, extr, intr, prior, descriptor, ref_descriptor,
+    def _encode(self, rgb, depth, extr, intr, prior, descriptor, ref_descriptor,
                 use_spatial_expectation=True, taper=1, projection=None,
                 overshadow=False, threshold=None):
         # All args are tuples, besides the kwargs.
@@ -463,7 +448,7 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         }
 
         kp, distance, kp_raw_2d, prior, sm, post = tuple(zip(
-            *(cls.compute_keypoints(r, d, e, i, desc, p, **kwargs)
+            *(self.compute_keypoints(r, d, e, i, desc, p, **kwargs)
               for r, d, e, i, desc, p in
               zip(rgb, depth, extr, intr, descriptor, prior))))
 
@@ -480,10 +465,6 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         if threshold:
             # repeat to fit size of kp-tensor which has x_comps, y_comps
-            # dist_per_cam = distance.chunk(n_cams, dim=-1)
-            # expanded_dist = torch.cat(
-            #     tuple(d.repeat(1, keypoint_dimension)
-            #           for d in dist_per_cam), dim=-1)
             expanded_dist = torch.cat(
                 tuple(d.repeat(1, keypoint_dimension)
                       for d in distance), dim=-1)
@@ -501,40 +482,12 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         return kp, info
 
-    @classmethod
-    def get_descriptor_distance(cls, descriptor, keypoints, ref_descriptor):
-        img_height, img_width = descriptor.shape[-2:]
-
-        # map from [-1, 1] to descriptor size
-        kp_x, kp_y = keypoints.chunk(2, dim=-1)
-        kp_x = ((kp_x + 1) * (img_width - 1)/2).long()
-        kp_y = ((kp_y + 1) * (img_height - 1)/2).long()
-
-        # extract per keypoint descriptor
-        B, N_kp = kp_y.shape
-        batch_indeces = [i for i in range(B) for _ in range(N_kp)]
-        desc_per_kp = channel_front2back_batch(
-            descriptor)[batch_indeces, kp_y.flatten(), kp_x.flatten(), :]
-        desc_per_kp = desc_per_kp.reshape(B, N_kp, -1)
-
-        # pairwise distance needs both inputs to have shape (N, D), so repeat
-        # the reference vector and flatten, afterwards unflatten
-        B, N_kp, d_kp = desc_per_kp.shape
-        desc_per_kp_flat = desc_per_kp.reshape((B * N_kp, d_kp))
-        ref_vec_flat = ref_descriptor.unsqueeze(
-            0).repeat(B, 1, 1).reshape((B * N_kp, d_kp))
-        distance = torch.nn.functional.pairwise_distance(
-            desc_per_kp_flat, ref_vec_flat).reshape(B, N_kp)
-
-        return distance
-
-    @classmethod
-    def compute_keypoints(cls, camera_obs, depth, extrinsics, intrinsics,
+    def compute_keypoints(self, camera_obs, depth, extrinsics, intrinsics,
                           descriptor, prior=None, ref_descriptor=None,
                           taper=1, use_spatial_expectation=False,
                           projection=None):
 
-        sm = cls.softmax_of_reference_descriptors(
+        sm = self.softmax_of_reference_descriptors(
             descriptor, ref_descriptor, taper=taper)
 
         post = prior * sm if prior is not None else sm
@@ -544,32 +497,13 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         # post += 1e-10
         # # normalize to sum to one
         post /= torch.sum(post, dim=(-1, -2)).unsqueeze(-1).unsqueeze(-1)
-        # vis_series(post[0].cpu(), channeled=False, file_name="post")
-        # exit()
 
-        # print(" ------------------------------------------")
-        # print(prior)
-        # print(sm)
-        # print(post)
-
-        # when using exp and eg Gaussian prior, the first frame has no prior
-        # and thus is too noisy, so use mode there instead.
-        # But does not matter for sm as Bayes filter.
-        if use_spatial_expectation:  # and prior is not None:
-            kp = cls.get_spatial_expectation(post)
+        if use_spatial_expectation:
+            kp = self.get_spatial_expectation(post)
         else:
-            kp = cls.get_mode(post)
+            kp = self.get_mode(post)
 
-        # TODO: does not work properly anymore when we manipulate the sm after
-        # compute descriptor distances for metric tracking
-        # distance = cls.get_descriptor_distance(descriptor, kp, ref_descriptor)
-        distance = None
-
-        # from viz.activation_map import activation_map
-        # from viz.image_series import vis_series
-        # vis_series(camera_obs.cpu())
-        # activation_map(sm, keypoints=kp)
-        # exit()
+        distance = None  # TODO: does not work properly anymore -> removed
 
         kp_raw_2d = kp
 
@@ -580,7 +514,7 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
                               "only for GT or particle filter models.")
         elif projection == ProjectionTypes.UVD:
             kp = append_depth_to_uv(
-                    kp, depth, cls.image_width - 1, cls.image_height - 1)
+                kp, depth, self.image_width - 1, self.image_height - 1)
         else:
             if projection in [ProjectionTypes.LOCAL_HARD,
                               ProjectionTypes.LOCAL_SOFT]:
@@ -591,36 +525,33 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
                               ProjectionTypes.GLOBAL_SOFT]:
                 kp = model_based_vision.soft_pixels_to_3D_world(
                     kp, post, depth, extrinsics, intrinsics,
-                    cls.image_width - 1, cls.image_height - 1)
+                    self.image_width - 1, self.image_height - 1)
             else:
                 kp = hard_pixels_to_3D_world(
                     kp, depth, extrinsics, intrinsics,
-                    cls.image_width - 1, cls.image_height - 1)
+                    self.image_width - 1, self.image_height - 1)
 
         return kp, distance, kp_raw_2d, prior, sm, post
 
-    def forward(self, batch, full_obs=None):
+    def forward(self, batch):
         """
         Custom forward method to also return the latent embedding for viz.
         """
-        return self.encode(batch, full_obs)
+        return self.encode(batch)
 
     def compute_descriptor(self, camera_obs):
-        # print("desc", camera_obs.min(), camera_obs.max())
         camera_obs = camera_obs.to(device)
         return self.model.compute_descriptors(camera_obs.unsqueeze(0))
 
     def compute_descriptor_batch(self, camera_obs, upscale=True):
-        # print("desc_batch", camera_obs.min(), camera_obs.max())
         camera_obs = camera_obs.to(device)
-        # camera_obs = channel_back2front_batch(camera_obs)
         return self.model.compute_descriptors(camera_obs, upscale=upscale)
 
     def reconstruct(self, batch):
         pass
 
-    @classmethod
-    def get_latent_dim(self, config, n_cams=1, image_dim=None):
+    @staticmethod
+    def get_latent_dim(config: dict, n_cams: int = 1, image_dim=None):
         projection = config["projection"]
 
         keypoint_dimension = 2 if projection is ProjectionTypes.NONE else 3
@@ -639,7 +570,9 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         # TODO: when not using SD should be n_keep
         return keypoint_dimension * config["keypoints"]["n_sample"] * n_obs
 
+    @indent_func_log
     def from_disk(self, chekpoint_path, ignore=None):
+        logger.info("Loading encoder checkpoint from {}", chekpoint_path)
         if ignore is None:
             ignore = tuple()
 
@@ -647,7 +580,7 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         state_dict = {k: v for k, v in state_dict.items() if k not in ignore}
 
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        if missing:
+        if missing and set(ignore) != set(missing):
             logger.warning("Missing keys: {}".format(missing))
         if unexpected:
             logger.warning("Unexpected keys: {}".format(unexpected))
@@ -655,10 +588,10 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         self.set_model_image_normalization()
 
-    def initialize_image_normalization(self, replay_memory, cam="wrist"):
+    def initialize_image_normalization(self, replay_memory, cam=("wrist",)):
         mean, std = replay_memory.estimate_image_mean_and_std(
-            self.pretrain_config["no_samples_normalization"],
-            cam=cam)
+            self.pretrain_config["no_samples_normalization"], cam=cam)
+
         self.norm_mean = torch.Tensor(mean)
         self.norm_std = torch.Tensor(std)
 
@@ -668,48 +601,95 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         self.model.setup_image_normalization(self.norm_mean.cpu().numpy(),
                                              self.norm_std.cpu().numpy())
 
-    def initialize_parameters_via_dataset(self, replay_memory):
-        self.select_reference_descriptors(replay_memory)
+    @indent_func_log
+    def initialize_parameters_via_dataset(self, replay_memory, cam):
+        self.select_reference_descriptors(replay_memory, cam=cam)
 
-    def select_reference_descriptors(self, replay_memory, traj_idx=0, img_idx=0,
-                                     object_labels=None, cam="wrist"):
-        # rgb, depth, mask, intr, ext = \
-        #     replay_memory.sample_data_point_with_cam_matrices(
-        #         cam="cam, img_idx=69, traj_idx=0)
-        # traj_idx = 1  # 0
-        # img_idx = 40  # 10
+    def select_reference_descriptors(
+            self, dataset: BCDataset, traj_idx: int = 0, img_idx: int = 0,
+            object_labels: Iterable[int] | None = None, cam: str = "wrist"
+            ) -> None:
+        """
+        Select reference descriptors from one observation in the replay memory.
+        Depending on config, randomly sampled or manually selected.
 
-        rgb, depth, mask = \
-            replay_memory.sample_data_point_with_object_labels(
+        Usually, for policy learning the used object labels are extracted
+        automatically from the dataset.
+        But for other purposes, it is possible to pass specific object labels
+        as well.
+
+        Parameters
+        ----------
+        dataset : BCDataset
+            The dataset from which to sample the reference descriptors.
+        traj_idx : int, optional
+            The trajectory index, by default 0
+        img_idx : int, optional
+            The observation index, by default 0
+        object_labels : Iterable[int] | None, optional
+            Object labels to sample from, by default None
+        cam : str, optional
+            The name of the camera to sample from, by default "wrist"
+
+        Raises
+        ------
+        NotImplementedError
+            For not implemented keypoint types.
+        ValueError
+            For invalid keypoint dimensions. Supported: 2, 3.
+        """
+
+        ref_obs = dataset.sample_data_point_with_object_labels(
                 cam=cam, img_idx=img_idx, traj_idx=traj_idx)
 
-        descriptor = self.compute_descriptor(rgb).detach()
-        object_labels = object_labels or replay_memory.get_object_labels()
+        object_labels = object_labels or dataset.get_object_labels()
 
         n_keypoints_total = self.config["keypoints"]["n_sample"]
         manual_kp_selection = self.pretrain_config.get('manual_kp_selection')
 
         if manual_kp_selection:
-            n_prev_frames = 20
-            # TODO: make generic in cam
-            preview_frames = replay_memory.sample_bc(
-                1, cam=(cam,)).cam_rgb.squeeze(1)
-            indeces = np.linspace(
-                start=0, stop=preview_frames.shape[0] - 1, num=n_prev_frames)
-            indeces = np.round(indeces).astype(int)
-            preview_frames = preview_frames.index_select(
-                dim=0, index=torch.tensor(indeces))
+            preview_obs = dataset._get_bc_traj(
+                traj_idx, cams=(cam,), fragment_length=-1, force_skip_rgb=False
+            )
 
-            preview_descr = self.compute_descriptor_batch(
-                preview_frames).detach()
+            indeces = np.linspace(0, stop=preview_obs.shape[0] - 1, num=20)
+            indeces = np.round(indeces).astype(int)
+            preview_obs = preview_obs.get_sub_tensordict(torch.tensor(indeces))
+
+            preview_frames = preview_obs.camera_obs[0].rgb
+            preview_descr = preview_obs.camera_obs[0].descriptor
+
         else:
             preview_frames = None
             preview_descr = None
 
+        if self.disk_read_embedding:
+            ref_descriptor = dataset.load_embedding(
+                img_idx=img_idx, traj_idx=traj_idx, cam=cam,
+                embedding_name=self.embedding_name).unsqueeze(0)
+
+            # Usually, encoder upsamples back to full resolution. For pre-
+            # computed that would waste disk-space, so upsample here.
+            img_h, img_w = ref_obs.rgb.shape[-2:]
+            if ref_descriptor.shape[-1] != ref_obs.rgb.shape[-1]:
+                logger.info("Upsampling descriptor to image size.")
+                ref_descriptor = torch.nn.functional.interpolate(
+                    ref_descriptor, size=tuple((img_h, img_w)),
+                    mode='bilinear', align_corners=True)
+
+                if preview_descr is not None and \
+                        preview_descr.shape[-1] != ref_obs.rgb.shape[-1]:
+                    preview_descr = torch.nn.functional.interpolate(
+                        preview_descr, size=tuple((img_h, img_w)),
+                        mode='bilinear', align_corners=True)
+        else:
+            ref_descriptor = self.compute_descriptor(ref_obs.rgb).detach()
+
         self.ref_pixels_uv, self._reference_descriptor_vec = \
             self._select_reference_descriptors(
-                rgb, descriptor, mask, object_labels, n_keypoints_total,
-                manual_kp_selection, preview_frames, preview_descr)
+                ref_obs.rgb, ref_descriptor, ref_obs.mask, object_labels,
+                n_keypoints_total, manual_kp_selection, preview_frames,
+                preview_descr)
 
         try:
             if self.config["keypoints"]["type"] is KeypointsTypes.SD:
@@ -730,37 +710,33 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         if self.debug_kp_selection:
             if self.keypoint_dimension == 2:
                 image_with_points_overlay_uv_list(channel_front2back(
-                    rgb.cpu()),
+                    ref_obs.rgb.cpu()),
                     (self.ref_pixels_uv[0].numpy(),
                      self.ref_pixels_uv[1].numpy()),
-                    mask=mask)
-                # descriptor_image_np = descriptor_image_tensor.cpu().numpy()
-                # plt.imshow(descriptor_image_np)
-                # plt.show()
+                    mask=ref_obs.mask)
             elif self.keypoint_dimension == 3:
                 depth_map_with_points_overlay_uv_list(
-                    depth.cpu().numpy(),
+                    ref_obs.depth.cpu().numpy(),
                     (self.ref_pixels_uv[0].numpy(),
                      self.ref_pixels_uv[1].numpy()),
-                    mask=mask.cpu().numpy())
+                    mask=ref_obs.mask.cpu().numpy())
             else:
                 raise ValueError("No viz for {}d keypoints.".format(
                     self.keypoint_dimension))
 
-        # print(self._reference_descriptor_vec.requires_grad)
-        # print(self.ref_pixels_uv.requires_grad)
-
     @classmethod
     def _select_reference_descriptors(
             cls, rgb, descriptor, mask, object_labels, n_keypoints_total,
-            manual_kp_selection, preview_frames=None, preview_descr=None):
+            manual_kp_selection, preview_frames=None, preview_descr=None,
+            object_order=None):
 
         if manual_kp_selection:
             ref_pixels_uv, reference_descriptor_vec = \
                 cls.manual_keypoints(
                     channel_front2back(rgb), descriptor, mask, object_labels,
                     n_keypoints_total,
-                    preview_rgb=preview_frames, preview_descr=preview_descr)
+                    preview_rgb=preview_frames, preview_descr=preview_descr,
+                    object_order=object_order)
 
         else:
             ref_pixels_uv, reference_descriptor_vec = \
@@ -769,8 +745,8 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         return torch.stack(ref_pixels_uv),  reference_descriptor_vec
 
-    @classmethod
-    def sample_keypoints(cls, rgb, descriptor, mask, object_labels,
+    @staticmethod
+    def sample_keypoints(rgb, descriptor, mask, object_labels,
                          n_keypoints_total):
         logger.info("Sampling keypoints.")
         descriptor = descriptor.cpu()
@@ -809,9 +785,10 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         return ref_pixels_uv, reference_descriptor_vec.to(device)
 
-    @classmethod
-    def manual_keypoints(cls, rgb, descriptor, mask, object_labels,
-                         n_keypoints, preview_rgb=None, preview_descr=None):
+    @staticmethod
+    def manual_keypoints(rgb, descriptor, mask, object_labels, n_keypoints,
+                         preview_rgb=None, preview_descr=None,
+                         object_order=None):
         # In this modul CV2 is imported, which causes RLBench to crash if its
         # loaded before the env is created, so import here instead.
         from viz.keypoint_selector import KeypointSelector
@@ -819,6 +796,9 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         descriptor = descriptor.cpu()
 
         logger.info("Please select {} keypoints.", n_keypoints)
+        if object_order is not None:
+            logger.info("Make sure to follow the object order {}.",
+                        object_order)
         kp_selector = KeypointSelector(
             rgb, descriptor, mask, n_keypoints,
             preview_rgb=preview_rgb, preview_descr=preview_descr)
@@ -855,38 +835,50 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         return ref_pixels_uv, reference_descriptor_vec.to(device)
 
     def reconstruct_ref_descriptor_from_gt(self, replay_memory, ref_pixels_uv,
-                                           ref_object_pose, traj_idx=0,
+                                           ref_object_poses, traj_idx=0,
                                            img_idx=0, cam="wrist"):
-        # traj_idx = 1  # 0
-        # img_idx = 40  # 10 # 10
-        rgb, depth, mask, intr, ext, object_pose = \
-            replay_memory.sample_data_point_with_ground_truth(
+
+        ref_obs = replay_memory.sample_data_point_with_ground_truth(
                 cam=cam, img_idx=img_idx, traj_idx=traj_idx)
 
-        object_pose = object_pose.to(device)
-        rgb = rgb.to(device)
+        rgb = ref_obs.rgb.to(device)
+        mask = ref_obs.mask.to(device)
+        object_poses = ref_obs.object_poses.to(device)
 
         # ensure it's the same observation
-        assert torch.equal(ref_object_pose, object_pose)
+        assert tensor_dict_equal(ref_object_poses, object_poses)
 
-        descriptor = self.compute_descriptor(rgb).detach().cpu()
+        if self.disk_read_embedding:
+            descriptor = replay_memory.load_embedding(
+                img_idx=img_idx, traj_idx=traj_idx, cam=cam,
+                embedding_name=self.embedding_name)
 
-        ref_pixels_flattened = \
-            ref_pixels_uv[1] * mask.shape[1] + ref_pixels_uv[0]
+            # Usually, encoder upsamples back to full resolution. For pre-
+            # computed that would waste disk-space, so upsample here.
+            img_h, img_w = rgb.shape[-2:]
+            if descriptor.shape[-1] != rgb.shape[-1]:
+                logger.info("Upsampling descriptor to image size.")
+                descriptor = torch.nn.functional.interpolate(
+                    descriptor.unsqueeze(0), size=tuple((img_h, img_w)),
+                    mode='bilinear', align_corners=True)
+        else:
+            descriptor = self.compute_descriptor(rgb).detach().cpu()
+
+        ref_pixels_flat = ref_pixels_uv[1] * mask.shape[1] + ref_pixels_uv[0]
 
         D = descriptor.shape[1]
         WxH = descriptor.shape[2] * descriptor.shape[3]
 
-        # now view as D, H*W
+        # view as D, H*W
         descriptor_image_tensor = descriptor.squeeze(
             0).contiguous().view(D, WxH)
 
-        # now switch back to H*W, D
+        # switch back to H*W, D
         descriptor_image_tensor = descriptor_image_tensor.permute(1, 0)
 
         # self.ref_descriptor_vec is Nref, D
         reference_descriptor_vec = torch.index_select(
-            descriptor_image_tensor, 0, ref_pixels_flattened)
+            descriptor_image_tensor, 0, ref_pixels_flat)
 
         return reference_descriptor_vec.to(device)
 
@@ -912,8 +904,8 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         return softmax_activations
 
-    @classmethod
-    def compute_reference_descriptor_distances(cls, descriptor_images,
+    @staticmethod
+    def compute_reference_descriptor_distances(descriptor_images,
                                                ref_descriptor, taper=1):
         N, D, H, W = descriptor_images.shape
         # print("N, D, H, W", N, D, H, W)
@@ -944,14 +936,13 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         return neg_squared_norm_diffs
 
-    @classmethod
-    def get_spatial_expectation(cls, softmax_activations):
+    def get_spatial_expectation(self, softmax_activations):
         # softmax_attentions shape is N, Nref, H, W
         # print(softmax_activations.shape)
-        expected_x = torch.sum(softmax_activations*cls.pos_x, dim=(2, 3))
+        expected_x = torch.sum(softmax_activations*self.pos_x, dim=(2, 3))
         # print(expected_x.shape, "expected_x.shape")
 
-        expected_y = torch.sum(softmax_activations*cls.pos_y, dim=(2, 3))
+        expected_y = torch.sum(softmax_activations*self.pos_y, dim=(2, 3))
         # print(expected_y.shape, "expected_y.shape")
 
         stacked_2d_features = torch.cat((expected_x, expected_y), 1)
@@ -959,8 +950,7 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
 
         return stacked_2d_features
 
-    @classmethod
-    def get_mode(cls, softmax_activations):
+    def get_mode(self, softmax_activations):
         # need argmax over two last dimensions, so join them first
         s = softmax_activations.shape
         sm_flat = softmax_activations.view(s[0], s[1], -1)
@@ -970,13 +960,13 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         modes_2d = modes_flat.unsqueeze(0).repeat((2, 1, 1))
 
         # get H, W from the flat indeces
-        modes_2d[1] = modes_2d[1] // cls.dc_width
-        modes_2d[0] = modes_2d[0] % cls.dc_width
+        modes_2d[1] = modes_2d[1] // self.dc_width
+        modes_2d[0] = modes_2d[0] % self.dc_width
 
         # map from [0, img_size] to [-1, 1] to match pixel_map from spatial exp
         modes_2d = modes_2d.float()
-        modes_2d[1] = modes_2d[1] / (cls.dc_height - 1) * 2 - 1
-        modes_2d[0] = modes_2d[0] / (cls.dc_width - 1) * 2 - 1
+        modes_2d[1] = modes_2d[1] / (self.dc_height - 1) * 2 - 1
+        modes_2d[0] = modes_2d[0] / (self.dc_width - 1) * 2 - 1
 
         # move new dim into the middle and flatten to get (N, 2*Nref)
         stacked_2d_features = torch.cat((modes_2d[0], modes_2d[1]), 1)
@@ -984,201 +974,3 @@ class KeypointsPredictor(encoder.representation_learner.RepresentationLearner):
         stacked_2d_features = stacked_2d_features.reshape(s[0], -1)
 
         return stacked_2d_features
-
-    @classmethod
-    def setup_pixel_maps(cls):
-        pos_x, pos_y = np.meshgrid(
-            np.linspace(-1., 1., cls.dc_width),
-            np.linspace(-1., 1., cls.dc_height)
-        )
-
-        cls.pos_x = torch.from_numpy(pos_x).float().to(device)
-        cls.pos_y = torch.from_numpy(pos_y).float().to(device)
-
-    def get_prior(self, prior_sm=None, prior_pos=None):
-        prior_type = self.config.get("prior_type", PriorTypes.NONE)
-
-        if prior_type in [PriorTypes.POS_GAUSS, PriorTypes.POS_UNI]:
-            try:
-                prior_var = self.config["prior_var"]
-            except ValueError:
-                logger.error("When specifying positinal prior (gaus or uniform"
-                            "), need to specify prior_var as well.")
-        else:
-            prior_var = None
-
-        return self._get_prior(prior_sm, prior_pos, prior_type,
-                               prior_var=prior_var)
-
-    @staticmethod
-    def _get_prior(prior_sm, prior_pos, prior_type, prior_var=None):
-        if prior_type is PriorTypes.NONE or prior_pos is None:
-            # First frame of trajectory. Use reference pixel positions and
-            # correct for camera movement.
-            # prior_pos = batched_project_onto_cam(
-            #     self.ref_pixel_world, depth, intrinsics, extrinsics)
-            # prior_pos = prior_pos/128 - 1  # TODO: make generic
-            # Can't account for object pose -> just use no prior here.
-            prior = None
-
-        elif prior_type in [PriorTypes.POS_GAUSS, PriorTypes.POS_UNI]:
-            use_gaussian = prior_type is PriorTypes.POS_GAUSS
-            assert prior_var is not None
-            # Non-frist frame. Use last frame's kp positions as prior.
-            # shape is (B, N*2), chunk x,y components and create new dim.
-            prior_pos = torch.stack(prior_pos.chunk(2, dim=-1), dim=-1)
-            # sm: (B,N,H,W), prior_pos: (B,N,2)
-            B, N = prior_pos.shape[0:2]
-            # TODO: make var config instead of hard-coded.
-            var = torch.tensor([prior_var], device=prior_pos.device)
-            var = var.unsqueeze(0).unsqueeze(0).repeat(B, N, 1)
-            prior = heatmap_from_pos(prior_pos, var, use_gaussian=use_gaussian)
-
-        elif prior_type is PriorTypes.DISCRETE_FILTER:
-            prior = prior_sm
-
-        elif prior_type is PriorTypes.PARTICLE_FILTER:
-            prior = None  # can't use the same simple matrix multiplication
-
-        else:
-            raise ValueError("Unexpected prior type {}".format(prior_type))
-
-        # vis_series(sm[0].cpu(), channeled=False, file_name="sm")
-        # vis_series(prior[0].cpu(), channeled=False, file_name="prior")
-
-        return prior
-
-    def get_motion_model(self, depth_a, intr_a, extr_a, depth_b, intr_b,
-                         extr_b):
-        """
-        Simple wrapper first checking wether the motion model is needed.
-        """
-        if depth_b is None or (self.config.get("prior_type", PriorTypes.NONE)
-                               is PriorTypes.NONE) or not self.config.get(
-                                   "use_motion_model"):
-            return None
-
-        return self._get_motion_model(
-            depth_a, intr_a, extr_a, depth_b, intr_b, extr_b)
-
-    @staticmethod
-    def _get_motion_model(depth_a, intr_a, extr_a, depth_b, intr_b, extr_b):
-        """
-        Computes the new position of all pixels of img_b in img_a. Doing so
-        in this way (and not the other way around), directly gives us pixel
-        coordinates for all positions in descriptor_b to read from for descr_a.
-        Makes things a bit smoother as the mapping might neither be injective,
-        nor surjective.
-        Instead of interpolating between pixels, just round to neareas pixel
-        position (currently done in apply_motion_model).
-        In case of a pixel position outside the view frustrum (eg. img_b has a
-        wider perspective than img_a), just take the nearest value inside the
-        frustrum, ie. pad descriptor_b with the outer-most values if needed.
-        closest value
-
-        Parameters
-        ----------
-        depth_a : Tensor (B, H, W)
-        intr_a : Tensor (B, 3, 3)
-        extr_a : Tensor (B, 4, 4)
-        depth_b : Tensor (B, H, W)
-        intr_b : Tensor (B, 3, 3)
-        extr_b : Tensor (B, 4, 4)
-
-        Returns
-        -------
-        Tensor (B, H, W, 2)
-        """
-        B, H, W = depth_a.shape
-
-        # create pixel coordinates
-        px_u = torch.arange(0, W, device=depth_a.device)
-        px_v = torch.arange(0, H, device=depth_a.device)
-        # (B, H*W, 2)
-        # cartesian product varies first dim first, so need to swap dims as
-        # u,v coordinates are 'right, down'
-        px_vu = torch.cartesian_prod(px_u, px_v).unsqueeze(0).repeat(B, 1, 1)
-
-        # project pixel coordinates of current img into pixel space of last cam
-        world = batched_pinhole_projection_image_to_world_coordinates(
-            px_vu[..., 1], px_vu[..., 0], depth_a.reshape(B, H*W),
-            intr_a, extr_a)
-        cam_b = batched_project_onto_cam(world, depth_b, intr_b, extr_b,
-                                         clip=False)
-        cam_b = cam_b.reshape((B, H, W, 2))
-
-        # moved rounding and clamping to apply_motion_model
-        # cam_b = torch.round(cam_b)
-        # cam_b[..., 0] = torch.clamp(cam_b[..., 0], 0, W - 1)
-        # cam_b[..., 1] = torch.clamp(cam_b[..., 1], 0, H - 1)
-
-        return cam_b
-
-    def apply_motion_model(self, descriptor, motion_model):
-
-        """
-        Simple wrapper suppling the motion_blur func of self.
-        """
-
-        return self._apply_motion_model(descriptor, motion_model,
-                                        blur_func=self.motion_blur)
-
-    @staticmethod
-    def _apply_motion_model(descriptor, motion_model, blur_func=None):
-        """
-        Apply the motion model to the descriptor image, i.e. for each pixel,
-        set the value of the returned image to the value of the pixel in the
-        image specified by the motion model.
-
-        The motion model is in pixel space, so subsample to descriptor size
-        first.
-
-        Parameters
-        ----------
-        descriptor :Tensor (B, N, H, W)
-        motion_model : Tensor (B, H', W', 2)
-
-        Returns
-        -------
-        Tensor (B, N, H, W)
-        """
-        if motion_model is None:
-            return descriptor
-
-        B, N, H, W = descriptor.shape
-        _, H2, W2, _ = motion_model.shape
-
-        # downsample motion model and map to new range
-        motion_model = torch.movedim(motion_model, 3, 1)
-        motion_model = torch.nn.functional.interpolate(
-            motion_model, size=(H, W), mode='bilinear', align_corners=True)
-        motion_model = torch.movedim(motion_model, 1, 3)
-        motion_model[..., 0] = torch.clamp(
-            torch.round(motion_model[..., 0] / W2 * W), 0, W - 1)
-        motion_model[..., 1] = torch.clamp(
-            torch.round(motion_model[..., 1] / H2 * H), 0, H - 1)
-
-        # add extra kp-dim and flatten
-        motion_model = motion_model.unsqueeze(1).repeat(1, N, 1, 1, 1)
-        mm_flat = motion_model.reshape((B*N*H*W, 2)).long()
-
-        batch_indeces = [i for i in range(B) for _ in range(N*H*W)]
-        kp_indeces = [i for _ in range(B) for i in range(N)
-                      for _ in range(H*W)]
-        # motion model is in uv coordinates, so 'swap' dim order
-        new_img_flat = descriptor[batch_indeces, kp_indeces,
-                                  mm_flat[..., 1], mm_flat[..., 0]]
-
-        new_img = new_img_flat.reshape((B, N, H, W))
-
-        new_img_wo_blur = new_img
-
-        if blur_func is not None:
-            new_img = blur_func(new_img)
-
-        assert not torch.equal(new_img_wo_blur, new_img)
-
-        # re-normalize
-        new_img /= torch.sum(new_img, dim=(-1, -2)).unsqueeze(-1).unsqueeze(-1)
-
-        return new_img

@@ -194,7 +194,7 @@ class LiveKeypoints:
             threshold = config["policy_config"]["encoder_config"].get(
                 "threshold_keypoint_dist")
 
-            cams = config["dataset_config"]["cams"]
+            cams = config["dataset_config"]["cameras"]
             n_cams = len(cams)
 
             fig_names = [

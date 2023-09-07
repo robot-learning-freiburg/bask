@@ -1,3 +1,4 @@
+import time
 from functools import partial
 
 import numpy as np
@@ -104,3 +105,16 @@ class KeyboardObserver:
         self.reset_button = False
         self.success = None
         return
+
+
+@logger.contextualize(filter=False)
+def wait_for_environment_reset(env, keyboard_obs):
+    if keyboard_obs is not None:
+        env.reset()
+        logger.info("Waiting for env reset. Confirm via input ...")
+        while True:
+            env.get_obs()
+            time.sleep(0.5)
+            if keyboard_obs.reset_button or keyboard_obs.success:
+                keyboard_obs.reset()
+                break

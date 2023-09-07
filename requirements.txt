@@ -22,3 +22,4 @@ scikit-learn
 nvitop
 timm
 # maniskill2
+tensordict

@@ -138,8 +138,8 @@ class HeatmapVisualization(object):
                 contrast_obj=self._config["different_objects"],
                 contrast_fraction=self._config["contrast_set_fraction"])
 
-        image_a_rgb = obs_a.cam_rgb
-        image_b_rgb = obs_b.cam_rgb
+        image_a_rgb = obs_a.rgb
+        image_b_rgb = obs_b.rgb
 
         self.tensor1 = image_a_rgb
         self.tensor2 = image_b_rgb
@@ -158,7 +158,7 @@ class HeatmapVisualization(object):
                 contrast_obj=self._config["different_objects"],
                 contrast_fraction=self._config["contrast_set_fraction"])
 
-        image_b_rgb = obs_b.cam_rgb
+        image_b_rgb = obs_b.rgb
 
         self.tensor2 = image_b_rgb
 

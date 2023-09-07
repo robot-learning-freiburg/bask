@@ -199,7 +199,7 @@ def axis_angle_to_quaternion(axis_angle: torch.Tensor) -> torch.Tensor:
     Returns:
         quaternions with real part first, as tensor of shape (..., 4).
     """
-    angles = torch.norm(axis_angle, p=2, dim=-1, keepdim=True)
+    angles = torch.norm(axis_angle, p=2, dim=-1, keepdim=True) # type: ignore
     half_angles = angles * 0.5
     eps = 1e-6
     small_angles = angles.abs() < eps
@@ -302,7 +302,7 @@ def matrix_to_quaternion(matrix: torch.Tensor, prefer_positives: bool = False,
     if prefer_continuous:
         preference_indicator = torch.Tensor(
             [0.5, 0.5, 0.5, 0.5]).unsqueeze(0)
-        [0.9238795, 0.2209424, 0.2209424, 0.2209424]
+        # [0.9238795, 0.2209424, 0.2209424, 0.2209424]
 
         # preference_indicator = torch.Tensor(
         #     [0.5, 0.5, 0.5]).unsqueeze(0)
@@ -383,7 +383,7 @@ def quaternion_to_axis_angle(quaternions: torch.Tensor) -> torch.Tensor:
             turned anticlockwise in radians around the vector's
             direction.
     """
-    norms = torch.norm(quaternions[..., 1:], p=2, dim=-1, keepdim=True)
+    norms = torch.norm(quaternions[..., 1:], p=2, dim=-1, keepdim=True) # type: ignore
     half_angles = torch.atan2(norms, quaternions[..., :1])
     angles = 2 * half_angles
     eps = 1e-6
@@ -540,34 +540,33 @@ def invert_intrinsics(matrix):
     return matrix.inverse()
 
 
-def batched_rigid_transform(xyz, transform):
+def batched_rigid_transform(xyz: torch.Tensor, transform: torch.Tensor
+                            ) -> torch.Tensor:
     """
     Transform: (B,4,4), Pointcloud (N,3) -> (B,N,3)
     """
-    xyz_h = torch.cat((xyz,
-                       torch.ones((*xyz.shape[:-1], 1), device=xyz.device)),
-                      axis=-1)
+    xyz_h = torch.cat((
+        xyz, torch.ones((*xyz.shape[:-1], 1), device=xyz.device)),
+        dim=-1)
     xyz_t_h = torch.transpose(
         transform @ torch.transpose(xyz_h, -1, -2), -1, -2)
     return xyz_t_h[..., :3]
 
 
-def batchwise_rigid_transform(xyz, transform):
+def batchwise_rigid_transform(xyz: torch.Tensor, transform: torch.Tensor
+                              ) -> torch.Tensor:
     """
     Transform: (B,4,4), Pointcloud (B,3) -> (B,3)
     """
-    xyz_h = torch.cat((xyz,
-                       torch.ones((*xyz.shape[:-1], 1), device=xyz.device)),
-                      axis=-1)
-    # xyz_t_h = torch.transpose(
-    #     torch.bmm(transform, torch.transpose(xyz_h, -1, -2).unsqueeze(-1)),
-    #     -1, -2)
-    # TODO: check again with a clear head
+    xyz_h = torch.cat(
+        (xyz, torch.ones((*xyz.shape[:-1], 1), device=xyz.device)),
+        dim=-1)
     xyz_t_h = torch.bmm(transform, xyz_h.unsqueeze(-1)).squeeze(-1)
     return xyz_t_h[..., :3]
 
 
-def cam2pix(cam_pts, cam_intr, get_depth=False):
+def cam2pix(cam_pts: torch.Tensor, cam_intr: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
     pix = torch.transpose(
         cam_intr @ torch.transpose(cam_pts, -1, -2), -1, -2)
 
@@ -575,13 +574,11 @@ def cam2pix(cam_pts, cam_intr, get_depth=False):
 
     pix = pix[..., :2]/pix[..., 2:3].repeat(1, 1, 2)
 
-    if get_depth:
-        return pix, z
-    else:
-        return torch.round(pix)
+    return pix, z
 
 
-def batchwise_cam2pix(cam_pts, cam_intr, get_depth=False):
+def batchwise_cam2pix(cam_pts: torch.Tensor, cam_intr: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
     pix = torch.bmm(cam_intr, cam_pts.unsqueeze(-1)).squeeze(-1)
 
     z = pix[..., 2]
@@ -589,10 +586,7 @@ def batchwise_cam2pix(cam_pts, cam_intr, get_depth=False):
     pix = pix[..., :2]/pix[..., 2:3].repeat(1, 2)
     pix = torch.round(pix)
 
-    if get_depth:
-        return pix, z
-    else:
-        return pix
+    return pix, z
 
 
 def batched_project_onto_cam(point_cloud, depth_im, cam_intr, cam_pose,
@@ -601,10 +595,8 @@ def batched_project_onto_cam(point_cloud, depth_im, cam_intr, cam_pose,
                                       invert_homogenous_transform(cam_pose))
     pix_z = cam_pts[:, :, 2]
 
-    if get_depth:
-        pix, depth = cam2pix(cam_pts, cam_intr, get_depth=True)
-    else:
-        pix = cam2pix(cam_pts, cam_intr)
+    pix, depth = cam2pix(cam_pts, cam_intr)
+
     pix_x, pix_y = pix[:, :, 0], pix[:, :, 1]
 
     if clip:
@@ -634,7 +626,7 @@ def batchwise_project_onto_cam(point_cloud, depth_im, cam_intr, cam_pose,
                                         invert_homogenous_transform(cam_pose))
     pix_z = cam_pts[:, 2]
 
-    pix, pix_depth = batchwise_cam2pix(cam_pts, cam_intr, get_depth=True)
+    pix, pix_depth = batchwise_cam2pix(cam_pts, cam_intr)
     pix_x, pix_y = pix[:, 0], pix[:, 1]
 
     if clip:
@@ -731,7 +723,7 @@ def batched_pinhole_projection_image_to_world_coordinates_orig(
     pos_in_camera_frame_homog = torch.cat((
         pos_in_camera_frame,
         torch.ones((*pos_in_camera_frame.shape[:-1], 1),
-                   device=pos_in_camera_frame.device)), axis=-1)
+                   device=pos_in_camera_frame.device)), dim=-1)
 
     pos_in_world_homog = torch.transpose(
         torch.matmul(camera_to_world,
@@ -743,7 +735,7 @@ def batched_pinhole_projection_image_to_world_coordinates_orig(
 
 def batched_pinhole_projection_image_to_camera_coordinates_orig(u, v, z, K):
     uv1 = torch.stack((u, v,
-                       torch.ones(u.shape, device=u.device)), axis=-1)
+                       torch.ones(u.shape, device=u.device)), dim=-1)
     K_inv = invert_intrinsics(K)
 
     pos = torch.transpose(
@@ -777,7 +769,7 @@ def batched_pinhole_projection_image_to_world_coordinates(u, v, depth, intr,
     pos_in_camera_frame_homog = torch.cat((
         pos_in_camera_frame,
         torch.ones((*pos_in_camera_frame.shape[:-1], 1),
-                   device=pos_in_camera_frame.device)), axis=-1)
+                   device=pos_in_camera_frame.device)), dim=-1)
 
     pos_in_world_homog = torch.transpose(
         torch.matmul(extr, torch.transpose(pos_in_camera_frame_homog, -1, -2)),
@@ -803,7 +795,7 @@ def batched_pinhole_projection_image_to_camera_coordinates(u, v, depth, intr):
     Tensor (B, N, 3)
     """
     uv1 = torch.stack((u, v,
-                       torch.ones(u.shape, device=u.device)), axis=-1)
+                       torch.ones(u.shape, device=u.device)), dim=-1)
     K_inv = invert_intrinsics(intr)
 
     pos = torch.transpose(

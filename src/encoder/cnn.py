@@ -3,6 +3,7 @@ import torch.nn as nn
 from loguru import logger
 
 import encoder.representation_learner
+from utils.observation import SingleCamObservation
 
 
 class CNN(encoder.representation_learner.RepresentationLearner):
@@ -23,31 +24,38 @@ class CNN(encoder.representation_learner.RepresentationLearner):
             nn.ELU(),
         )
 
-    def encode(self, camera_obs, full_obs=None):
+    def encode_single_camera(self, batch: SingleCamObservation
+                             ) -> tuple[torch.Tensor, dict]:
+        camera_obs = batch.rgb
+
+        rgb_resolution = camera_obs.shape[-2:]
+
+        subsample_resolution = self._get_subsample_resolution(rgb_resolution)
+
         camera_obs = nn.functional.interpolate(
-            camera_obs, size=(128, 128), mode='bilinear', align_corners=True)
+            camera_obs, size=subsample_resolution, mode='bilinear',
+            align_corners=True)
+
         cam_emb = self.model(camera_obs)
-
-        if (cam_obs2 := full_obs.cam_rgb2) is not None:
-            cam_obs2 = nn.functional.interpolate(
-                cam_obs2, size=(128, 128), mode='bilinear', align_corners=True)
-            cam_emb2 = self.model(cam_obs2)
-
-            cam_emb = torch.cat((cam_emb, cam_emb2), dim=-1)
 
         info = {}
 
         return cam_emb, info
 
+    def _get_subsample_resolution(self, cam_res):
+        return tuple((cam_res[0]//2, cam_res[1]//2))
+
     @classmethod
-    def get_latent_dim(self, config, n_cams=1, image_dim=None):
-        dim_mapping = {(256, 256): 256,
-                       # (480, 480): ???
-                       }
+    def get_latent_dim(cls, config, n_cams=1, image_dim=(None, None)):
+        dim_mapping = {
+            (256, 256): 256,
+            (360, 480): 690,
+            }
+
         return dim_mapping[image_dim] * n_cams
 
     def from_disk(self, chekpoint_path):
-        logger.info("  CNN encoder does not need snapshot loading. Skipping.")
+        logger.info("CNN encoder does not need snapshot loading. Skipping.")
 
 
 class CNNDepth(CNN):
@@ -65,12 +73,13 @@ class CNNDepth(CNN):
             nn.ELU(),
         )
 
-    def forward(self, batch, full_obs=None):
-        depth = full_obs.cam_d.unsqueeze(1)
-        batch = torch.cat((batch, depth), dim=-3)
+    def forward(self, batch):
+        rgb = batch.cam_rgb
+        depth = batch.cam_d.unsqueeze(1)
+        batch.cam_rgb = torch.cat((rgb, depth), dim=-3)
 
-        if (cam_obs2 := full_obs.cam_rgb2) is not None:
-            depth2 = full_obs.cam_d2.unsqueeze(1)
-            full_obs.cam_rgb2 = torch.cat((cam_obs2, depth2), dim=-3)
+        if (cam_obs2 := batch.cam_rgb2) is not None:
+            depth2 = batch.cam_d2.unsqueeze(1)
+            batch.cam_rgb2 = torch.cat((cam_obs2, depth2), dim=-3)
 
-        return self.encode(batch, full_obs=full_obs), {}
+        return self.encode(batch), {}

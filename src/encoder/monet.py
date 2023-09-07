@@ -3,7 +3,7 @@ from torch import nn
 
 import encoder.representation_learner
 import models.monet.monet as monet
-from utils.constants import SampleTypes
+from utils.observation import SampleTypes, SingleCamObservation
 from utils.select_gpu import device
 
 
@@ -88,28 +88,26 @@ class Monet(encoder.representation_learner.RepresentationLearner):
 
         return training_metrics
 
-    def encode(self, camera_obs, full_obs=None):
-        camera_obs = nn.functional.interpolate(
-            camera_obs, size=(128, 128), mode='bilinear', align_corners=True)
+    def encode_single_camera(self, batch: SingleCamObservation
+                             ) -> tuple[torch.Tensor, dict]:
+        camera_obs = batch.rgb
 
-        # "The concatenation of the N embeddings obtained from the sequential
-        # application of the VAE to the N attention-attenuated input images
-        # constitute the final MONet embedding epsilon.""
-        # NOTE: I assume that from each individual VAE, we again just take mu
+        rgb_resolution = camera_obs.shape[-2:]
+
+        subsample_resolution = self._get_subsample_resolution(rgb_resolution)
+
+        camera_obs = nn.functional.interpolate(
+            camera_obs, size=subsample_resolution, mode='bilinear',
+            align_corners=True)
 
         z_mu, z_logvar = self.model.encode(camera_obs)
-
-        if (cam_obs2 := full_obs.cam_rgb2) is not None:
-            cam_obs2 = nn.functional.interpolate(
-                cam_obs2, size=(128, 128), mode='bilinear', align_corners=True)
-
-            z_mu2, z_logvar2 = self.model.encode(cam_obs2)
-
-            z_mu = torch.cat((z_mu, z_mu2), dim=-1)
 
         info = {}
 
         return z_mu, info
+
+    def _get_subsample_resolution(self, cam_res):
+        return tuple((cam_res[0]//2, cam_res[1]//2))
 
     def evaluate(self, batch, dataset_size=None, batch_size=None,
                  **kwargs):

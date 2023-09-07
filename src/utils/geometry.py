@@ -53,6 +53,12 @@ def euler_to_quaternion(euler_angle):
     return quaternion
 
 
+def euler_to_quaternion_np(euler_angle):
+    quaternion = euler_to_quaternion(euler_angle)
+
+    return np.array(quaternion)
+
+
 def quaternion_to_euler(quaternion):
     qx, qy, qz, qw = quaternion
     roll = np.arctan2(2*(qw*qx + qy*qz), 1-2*(qx**2+qy**2))

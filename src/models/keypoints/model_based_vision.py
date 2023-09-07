@@ -26,10 +26,8 @@ def pinhole_projection_image_to_world_coordinates(uv, z, K, camera_to_world):
 
     pos_in_camera_frame = pinhole_projection_image_to_camera_coordinates(
         uv, z, K)
-    # print(pos_in_camera_frame)
     pos_in_camera_frame_homog = np.append(pos_in_camera_frame, 1)
     pos_in_world_homog = camera_to_world.dot(pos_in_camera_frame_homog)
-    # print(pos_in_world_homog)
     return pos_in_world_homog[:3]
 
 
@@ -102,7 +100,6 @@ def raw_pixels_to_3D_world(
         camera_to_world,  # N, 4, 4 , on cpu
         K              # N, 3, 3, on cpu
         ):
-
     """
     Like the function above, but takes raw pixels, ie. in [0,H/W]), not [-1.1].
     """

@@ -1,5 +1,3 @@
-import typing
-
 import matplotlib.pyplot as plt
 import torch
 from loguru import logger
@@ -15,6 +13,7 @@ class ParticleFilter:
         self.batch_size = None
         self.n_keypoints = None
 
+        self.cam_height = config["obs_config"]["image_dim"][0]
         self.cam_width = config["obs_config"]["image_dim"][1]
 
         self.weights = None
@@ -63,7 +62,7 @@ class ParticleFilter:
         self.depth_model_sigma_abs = 0.001
         self.taper = 4
         self.taper_initial_sample = True
-        self.extra_init_taper = 4  # NOTE: 2 on rubbish
+        self.extra_init_taper = 16  # NOTE: 4 on sim envs, 2 on rubbish
         self.base_descr_measurement_model = lambda x: torch.exp(self.taper*x)
 
         self.ref_pixel_world = ref_pixel_world
@@ -229,7 +228,7 @@ class ParticleFilter:
 
     def update(self, rgb: tuple, depth: tuple, extr: tuple, intr: tuple,
                descriptor: tuple, ref_descriptor: torch.Tensor,
-               gripper_pose: torch.Tensor = None) -> None:
+               gripper_pose: torch.Tensor | None = None) -> None:
         KeypointsPredictor = encoder.keypoints.KeypointsPredictor
 
         diffs = tuple(
@@ -393,7 +392,15 @@ class ParticleFilter:
 
         # Filter outside values from descriptor distances
         if type(self.descriptor_distance_for_outside_pixels) is tuple:
+            # HACK: if the value in the tuple is again a tuple, unpack it as
+            # well and use the first value for the first half of the keypoints,
+            # etc. Useful for having different distances per object.
             outside_descr_dist_val = tuple(
+                torch.cat([
+                    torch.tensor(-d_obj, dtype=torch.float32, device=device
+                                  ).repeat(int(self.n_keypoints/len(d)))
+                    for d_obj in d],
+                    dim=0).unsqueeze(0).unsqueeze(-1) if type(d) is tuple else
                 torch.tensor(-d, dtype=torch.float32, device=device)
                 for d in self.descriptor_distance_for_outside_pixels)
         else:
@@ -500,7 +507,10 @@ class ParticleFilter:
                                                   b_extr, b_intr,
                                                   clip=self.clip_projection)
 
-            px_mean = (m.squeeze(0)*2/self.cam_width - 1 for m in px_mean)
+            px_mean = (torch.stack(
+                (m[0, :, :, 0]*2/self.cam_width - 1,
+                 m[0, :, :, 1]*2/self.cam_height - 1), dim=2)
+                for m in px_mean)
             m_depth = tuple(m.unsqueeze(0).unsqueeze(-1) for m in m_depth)
 
             if self.projection_type in (
@@ -551,7 +561,16 @@ class ParticleFilter:
             coordinates = apply_motion_randomly(coordinates, gripper_delta,
                                                 self.gripper_motion_prob)
 
-        return add_gaussian_noise(coordinates, self.noise_scale)
+        # HACK
+        if type(self.noise_scale) is tuple:
+            noise_scale = torch.cat(
+                [torch.tensor(n, dtype=torch.float32, device=device).repeat(
+                    int(self.n_keypoints/len(self.noise_scale)))
+                 for n in self.noise_scale], dim=0).unsqueeze(0)
+        else:
+            noise_scale = self.noise_scale
+
+        return add_gaussian_noise(coordinates, noise_scale)
 
     def update_consistency_model(self, mean):
         if self.t == 0:
@@ -773,20 +792,20 @@ def project_particles_to_camera(coordinates: torch.tensor,
     return heatmap, keypoint
 
 
-def get_neff(weights: torch.tensor):
+def get_neff(weights: torch.Tensor):
     n_eff = 1. / weights.square().sum(dim=-1)
 
     return n_eff
 
 
-def normalize(weights: torch.tensor, eps=1e-30):
+def normalize(weights: torch.Tensor, eps=1e-30):
     weights += eps
     normalized = weights / weights.sum(keepdim=True, dim=-1)
 
     return normalized
 
 
-def project_onto_image(coord_3d: torch.tensor, depth: tuple, extr: tuple,
+def project_onto_image(coord_3d: torch.Tensor, depth: tuple, extr: tuple,
                        intr: tuple, clip_value: int = -1, clip: bool = True,
                        drop_names: bool = True):
     names = coord_3d.names
@@ -806,7 +825,7 @@ def project_onto_image(coord_3d: torch.tensor, depth: tuple, extr: tuple,
     return cam, proj_depth
 
 
-def named_repeat(named_tensor: torch.tensor, repeats: tuple) -> torch.tensor:
+def named_repeat(named_tensor: torch.Tensor, repeats: tuple) -> torch.Tensor:
     names = named_tensor.names
     repeated = named_tensor.rename(None).repeat(*repeats)
 
@@ -831,7 +850,7 @@ def uniform_sample(batch_size, n_keypoints, n_particles, x_min=-1, x_max=1,
 def sample_from_obs(depth: tuple, extr: tuple, intr: tuple, diffs: tuple,
                     samples_total: int, depth_model_sigma_rel: float,
                     depth_model_sigma_abs: float, axes=None, re_axes=None
-                    ) -> torch.tensor:
+                    ) -> torch.Tensor:
 
     n_cams = len(depth)
     samples_per_cam = int(samples_total / n_cams)
@@ -906,7 +925,7 @@ def sample_from_obs(depth: tuple, extr: tuple, intr: tuple, diffs: tuple,
     # .refine_names('B', 'K', 'P', 'D')  # Batch, keypoint, particle, dim
 
 
-def refine_with_prior(coordinates: torch.tensor, ref_coordinates: torch.tensor,
+def refine_with_prior(coordinates: torch.Tensor, ref_coordinates: torch.Tensor,
                       consistency_alpha: float):
     B, K, P, D = coordinates.shape
 
@@ -931,16 +950,21 @@ def refine_with_prior(coordinates: torch.tensor, ref_coordinates: torch.tensor,
     return cons_likelihood
 
 
-def add_gaussian_noise(coordinates: torch.tensor,
-                       noise_scale: typing.Union[float, torch.tensor],
-                       skip_z: bool = False):
+def add_gaussian_noise(coordinates: torch.Tensor,
+                       noise_scale: float | torch.Tensor) -> torch.Tensor:
+
     gauss = torch.distributions.normal.Normal(0, noise_scale)
-    noise = gauss.sample(coordinates.shape).to(device)
+    sample_shape = coordinates.shape if type(noise_scale) == float \
+        else coordinates.shape[2:]
+    noise = gauss.sample(sample_shape).to(device)
+
+    if not type(noise_scale) == float:
+        noise = noise.permute(2, 3, 0, 1)
 
     return coordinates + noise
 
 
-def apply_motion_randomly(coordinates: torch.tensor, delta: torch.tensor,
+def apply_motion_randomly(coordinates: torch.Tensor, delta: torch.Tensor,
                           prob: float):
 
     random_mask = torch.rand(coordinates.shape[:-1], device=device) < prob
@@ -948,7 +972,7 @@ def apply_motion_randomly(coordinates: torch.tensor, delta: torch.tensor,
     return coordinates + random_mask.unsqueeze(3) * delta
 
 
-def get_pairwise_distance(descriptors: torch.tensor):
+def get_pairwise_distance(descriptors: torch.Tensor):
     K, D = descriptors.shape
 
     # compute pairwise distance matrix of kp means
@@ -962,18 +986,7 @@ def get_pairwise_distance(descriptors: torch.tensor):
 
     return dist
 
-
-# https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python/blob/master/12-Particle-Filters.ipynb
-# Systematic sampling does an excellent job of ensuring we sample from all
-# parts of the particle space while ensuring larger weights are proportionality
-# resampled more often. Stratified resampling is not quite as uniform as
-# systematic resampling, but it is a bit better at ensuring the higher weights
-# get resampled more.
-# As I have relatively few particles and a expect a relatively sparse
-# hypothesis space, I go with stratified resampling for now.
-# If that does not work, I might revisit systematic resampling.
-
-def stratified_resample(weights: torch.tensor) -> torch.tensor:
+def stratified_resample(weights: torch.Tensor) -> torch.Tensor:
     n_particles = weights.shape[-1]
     positions = (torch.rand_like(weights) +
                  torch.arange(n_particles, device=device)
@@ -991,27 +1004,7 @@ def stratified_resample(weights: torch.tensor) -> torch.tensor:
 
     return indeces.long()
 
-    # Non-batched version
-    # Adapted from: https://github.com/rlabbe/filterpy/blob/master/filterpy
-    # positions = (torch.rand((n_particles, )) +
-    #              torch.arange(n_particles)) / n_particles
-
-    # indeces = torch.empty_like(positions, dtype=torch.int)
-    # cumulative_sum = torch.cumsum(weights)
-
-    # i, j = 0, 0
-
-    # while i < n_particles:
-    #     if positions[i] < cumulative_sum[j]:
-    #         indeces[i] = j
-    #         i += 1
-    #     else:
-    #         j += 1
-
-    # return indeces
-
-
-def systematic_resample(weights: torch.tensor) -> torch.tensor:
+def systematic_resample(weights: torch.Tensor) -> torch.Tensor:
     n_particles = weights.shape[-1]
 
     positions = (

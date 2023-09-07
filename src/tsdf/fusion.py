@@ -1,49 +1,26 @@
-# Copyright (c) 2018 Andy Zeng
+# Copyright (c) 2018 Andy Zeng, 2023 Jan Ole von Hartz
+
+import pickle
+import time
+from pathlib import Path
 
 import numpy as np
+import pyrender
+import torch
+import trimesh
 from loguru import logger
 from numba import njit, prange
 from skimage import measure
+from tqdm.auto import tqdm
 
-kilo = 1024
+from tsdf.filter import cut_volume_with_box, filter_background, filter_gripper
+from utils.cuda import FUSION_GPU_MODE, cuda
+from utils.select_gpu import device
+from utils.torch import batched_rigid_transform, invert_homogenous_transform
+from viz.operations import np_channel_front2back
 
-try:
-    # import pycuda
-    # import pycuda.autoinit
-    import pycuda.driver as cuda
-    from pycuda.compiler import SourceModule
-    FUSION_GPU_MODE = 1
-except Exception as err:
-    logger.warning('{}', err)
-    logger.warning('Failed to import PyCUDA. Running fusion in CPU mode.')
-    FUSION_GPU_MODE = 0
-
-
-def make_context(device):
-    gpu_num = device.index if device.type == 'cuda' else None
-
-    if gpu_num is None:
-        return None
-    else:
-        return cuda.Device(gpu_num).make_context()
-
-
-def destroy_context(context):
-    if context is not None:
-        context.pop()
-
-
-def debug_memory(device):
-    gpu_num = device.index if device.type == 'cuda' else None
-
-    if gpu_num is None:
-        return None
-    else:
-        free, total = cuda.mem_get_info()
-        free /= kilo**3
-        total /= kilo**3
-        logger.info("{:.1f} GB of {:.1f} GB total memory are free on device {}",
-                    free, total, device)
+if FUSION_GPU_MODE:
+    from pycuda.compiler import SourceModule  # type: ignore
 
 
 class TSDFVolume:
@@ -527,3 +504,172 @@ def pcwrite(filename, xyzrgb):
           xyz[i, 0], xyz[i, 1], xyz[i, 2],
           rgb[i, 0], rgb[i, 1], rgb[i, 2],
         ))
+
+
+def estimate_volume_bounds(rgb: np.ndarray, depth: np.ndarray,
+                           intrinsics: np.ndarray, extrinsics: np.ndarray
+                           ) -> np.ndarray:
+    vol_bnds = np.zeros((3, 2))
+    n_imgs = rgb.shape[0]
+    for i in range(n_imgs):
+        cam_intr = intrinsics[i]
+        cam_pose = extrinsics[i]
+        depth_im = depth[i]
+
+        # Compute camera view frustum and extend convex hull
+        view_frust_pts = get_view_frustum(depth_im, cam_intr, cam_pose)
+        vol_bnds[:, 0] = np.minimum(
+            vol_bnds[:, 0], np.amin(view_frust_pts, axis=1))
+        vol_bnds[:, 1] = np.maximum(
+            vol_bnds[:, 1], np.amax(view_frust_pts, axis=1))
+
+    return vol_bnds
+
+
+def fuse(rgb: np.ndarray, depth: np.ndarray, intrinsics: np.ndarray,
+         extrinsics: np.ndarray, coordinate_box: np.ndarray,
+         gripper_dist: float, remove_background: bool = True,
+         remove_gripper: bool = True) -> TSDFVolume:
+
+    if remove_background:
+        depth = filter_background(depth, extrinsics, intrinsics,
+                                  coordinate_box)
+    if remove_gripper:
+        depth = filter_gripper(depth, gripper_dist)
+
+    logger.info("Estimating voxel volume bounds...")
+    vol_bnds = estimate_volume_bounds(rgb, depth, intrinsics, extrinsics)
+    logger.info("Refining voxel volume bounds with box filter...")
+    vol_bnds = cut_volume_with_box(vol_bnds, box=coordinate_box)
+
+    logger.info("Doing rough TSDF pass to refine voxel volume bounds...")
+    rough_vol = integrate_volume(rgb, depth, intrinsics, extrinsics,
+                                 vol_bnds, voxel_size=0.02)
+    pc = rough_vol.get_point_cloud()[:, :3]
+    rough_voxel_bnds = np.stack((pc.min(axis=0) - .02, pc.max(axis=0) + .02)).T
+    vol_bnds = cut_volume_with_box(vol_bnds, box=rough_voxel_bnds)
+
+    logger.info("Doing fine TSDF pass...")
+    fine_vol = integrate_volume(rgb, depth, intrinsics, extrinsics,
+                                vol_bnds, voxel_size=0.001)
+
+    return fine_vol
+
+
+def integrate_volume(rgb: np.ndarray, depth: np.ndarray,
+                     intrinsics: np.ndarray, extrinsics: np.ndarray,
+                     vol_bnds: np.ndarray, voxel_size: float):
+    logger.info("Initializing voxel volume...")
+    tsdf_vol = TSDFVolume(vol_bnds, voxel_size=voxel_size)
+
+    # Loop through RGB-D images and fuse them together
+    t0_elapse = time.time()
+    n_imgs = rgb.shape[0]
+    for i in tqdm(range(n_imgs)):
+
+        color_image = np_channel_front2back(rgb[i])
+        cam_intr = intrinsics[i]
+        depth_im = depth[i]
+        cam_pose = extrinsics[i]
+
+        tsdf_vol.integrate(color_image, depth_im, cam_intr,
+                           cam_pose, obs_weight=1.)
+
+    fps = n_imgs / (time.time() - t0_elapse)
+    logger.info("Average FPS: {:.2f}".format(fps))
+
+    return tsdf_vol
+
+
+def write_mesh(tsdf_vol: TSDFVolume, mesh_filename: Path
+               ) -> tuple[np.ndarray, np.ndarray]:
+    logger.info("Saving mesh to mesh.ply...")
+    verts, faces, norms, colors = tsdf_vol.get_mesh()
+    meshwrite(mesh_filename, verts, faces, norms, colors)
+
+    return verts, faces
+
+
+def write_pc(tsdf_vol: TSDFVolume, pc_filename: Path) -> None:
+    logger.info("Saving point cloud to pc.ply...")
+    point_cloud = tsdf_vol.get_point_cloud()
+    pcwrite(pc_filename, point_cloud)
+
+
+def build_masks_via_mesh(vertices_np: np.ndarray, faces: np.ndarray,
+                         pc_labels: np.ndarray, intrinsics: torch.Tensor,
+                         extrinsics: torch.Tensor, H: int, W: int
+                         ) -> tuple[torch.Tensor, np.ndarray]:
+
+    intrinsics = intrinsics.cpu().numpy()
+
+    labels = np.unique(pc_labels)
+
+    mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces, process=False)
+
+    B = extrinsics.shape[0]
+
+    # Long trajectory can still fill up GPU memory. So batchify projection.
+    vertices = torch.from_numpy(mesh.vertices).float().to(device).unsqueeze(0)
+
+    batch_no = 4
+    extr_batches = torch.chunk(extrinsics, batch_no)
+
+    projected_all = []
+
+    for j, e in enumerate(extr_batches):
+        b = e.shape[0]
+        proj = batched_rigid_transform(vertices.expand(b, -1, -1),
+                                       invert_homogenous_transform(e))
+
+        projected_all.append(proj)
+
+    vertices = torch.cat(projected_all)
+
+    masks = []
+
+    for j in tqdm(range(B)):
+        mesh.vertices = vertices[j].cpu().numpy()
+
+        # split mesh according to clustering
+        meshes = [mesh.copy() for _ in range(len(labels))]
+        for i in range(len(labels)):
+            meshes[i].update_vertices(pc_labels == labels[i])
+
+        # convert to pyrender scene instead of trimesh to use their segmentation mask renderer
+        pyrender_scene = pyrender.Scene()
+        node_labels = {}
+        for i in range(len(labels)):
+            sub_mesh = pyrender.Mesh.from_trimesh(meshes[i])
+            sm_node = pyrender.Node(mesh=sub_mesh)
+            pyrender_scene.add_node(sm_node)
+            # add to dict for consistent labels
+            node_labels[sm_node] = labels[i]
+        K = intrinsics[j]
+        # as we projected the pc into camera frame, use neutral cam pose
+        # need to fix axis direction though
+        RT = np.eye(4)
+        RT[1][1] = -1
+        RT[2][2] = -1
+        fx = K[0, 0]
+        fy = K[1, 1]
+        cx = K[0, 2]
+        cy = K[1, 2]
+        zfar = 1000
+        znear = 0.01
+        cam = pyrender.IntrinsicsCamera(fx, fy, cx, cy, znear, zfar)
+        cam_node = pyrender_scene.add(cam, pose=RT)
+        renderer = pyrender.OffscreenRenderer(viewport_width=W,
+                                              viewport_height=H)
+        render_results = renderer.render(
+            pyrender_scene, pyrender.RenderFlags.SEG, node_labels)
+        assert render_results is not None
+        mask = render_results[0]
+        masks.append(mask[..., 0])
+
+    return torch.from_numpy(np.stack(masks)), labels
+
+
+def write_mask(mask: np.ndarray, file_name: str) -> None:
+    logger.info("Saving mask to mask.pkl...")
+    pickle.dump(mask, open(file_name, "wb"))

@@ -2,7 +2,24 @@ from dataset.dc import DcDatasetDataType
 from encoder.keypoints import LRScheduleTypes, PriorTypes, ProjectionTypes
 from models.keypoints.keypoints import KeypointsTypes
 
+METADATA_FILENAME = 'metadata.json'
+
+DATA_SUFFIX = ".dat"
+IMG_SUFFIX = ".png"
+
+LINEAR_DISTANCE_THRESHOLD = 0.03  # 3cm
+ANGLE_DISTANCE_THRESHOLD = 10  # 10 degree
+
+# TODO: detect from dataset? Still needed when configuring env.
+sim_cam_resolution = (256, 256)
+realsense_cam_resolution = (360, 640)
+realsense_cam_resolution_cropped = (360, 480)
+realsense_cam_crop = (160, 0, 0, 0)  # NOTE: left, right, top, bottom
+
+realsense_conf_path = "PATH/src/utils/realsense.yaml"
+
 camera_pose = {
+    "base": [0.2, 0, 0.2, 0, 0.194, 0, -0.981],
     "overhead": [0.2, 0, 0.2, 7.7486e-07, -0.194001, 7.7486e-07, 0.981001]
 }
 

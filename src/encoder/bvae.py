@@ -4,7 +4,7 @@ from torch.nn import functional as F
 
 import encoder.representation_learner
 import models.bvae.beta_vae as bvae
-from utils.constants import SampleTypes
+from utils.observation import SampleTypes, SingleCamObservation
 from utils.select_gpu import device
 
 
@@ -68,7 +68,6 @@ class BVAE(encoder.representation_learner.RepresentationLearner):
 
         return metrics
 
-    # TODO: should be same in every encoder -> remove
     def update_params(self, batch, dataset_size=None, batch_size=None,
                       **kwargs):
         batch = batch.to(device)
@@ -84,26 +83,27 @@ class BVAE(encoder.representation_learner.RepresentationLearner):
 
         return training_metrics
 
-    def encode(self, camera_obs, full_obs=None):
+    def encode_single_camera(self, batch: SingleCamObservation
+                             ) -> tuple[torch.Tensor, dict]:
+        camera_obs = batch.rgb
+
+        rgb_resolution = camera_obs.shape[-2:]
+
+        subsample_resolution = self._get_subsample_resolution(rgb_resolution)
+
         camera_obs = nn.functional.interpolate(
-            camera_obs, size=(128, 128), mode='bilinear', align_corners=True)
+            camera_obs, size=subsample_resolution, mode='bilinear',
+            align_corners=True)
 
         mu, log_var = self.model.encode(camera_obs)
-
-        if full_obs is not None:
-            if (cam_obs2 := full_obs.cam_rgb2) is not None:
-                cam_obs2 = nn.functional.interpolate(
-                    cam_obs2, size=(128, 128), mode='bilinear', align_corners=True)
-
-                mu2, log_var2 = self.model.encode(cam_obs2)
-
-                mu = torch.cat((mu, mu2), dim=-1)
 
         info = {}
 
         return mu, info  # see paper: treating mu as embedding
 
-    # TODO: should be same in every encoder -> remove
+    def _get_subsample_resolution(self, cam_res):
+        return tuple((cam_res[0]//2, cam_res[1]//2))
+
     def evaluate(self, batch, dataset_size=None, batch_size=None,
                  **kwargs):
         batch = batch.to(device)
@@ -122,5 +122,5 @@ class BVAE(encoder.representation_learner.RepresentationLearner):
         return self.model(batch)[0]
 
     @classmethod
-    def get_latent_dim(self, config, n_cams=1, image_dim=None):
+    def get_latent_dim(cls, config, n_cams=1, image_dim=None):
         return config["latent_dim"] * n_cams

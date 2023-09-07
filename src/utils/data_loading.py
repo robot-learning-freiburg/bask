@@ -1,13 +1,66 @@
+from abc import ABC
+from typing import Callable
 
 import numpy as np
+import torch
+import torchvision
 from loguru import logger
-from torch.utils.data import DataLoader, SubsetRandomSampler
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 
 
-def build_data_loaders(replay_memory, collate_func, config,
-                       train_workers=1, train_prefetch=1,
-                       val_workers=0, val_prefetch=1,
-                       drop_last=False, shuffle=True):
+class InfiniteDataIterator(ABC):
+    def __init__(self, data_loader: DataLoader):
+        self.data_loader = data_loader
+        self.data_iterator = iter(data_loader)
+
+    def __iter__(self):
+        raise NotImplementedError("To be implemented by subclass.")
+
+
+class AutoResettingDataIterator(InfiniteDataIterator):
+    """
+    Infinite iterator over a DataLoader. Creates a new iterator when the old
+    one is exhausted during a call to __iter__.
+    """
+
+    def __next__(self):
+        try:
+            batch = next(self.data_iterator)
+        except StopIteration:
+            self.data_iterator = iter(self.data_loader)
+            batch = next(self.data_iterator)
+
+        return batch
+
+
+class ReplenishingDataIterator(InfiniteDataIterator):
+    """
+    Infinite iterator over a DataLoader. For full set evaluation.
+    In contrast to InfiniteDataIterator, this iterator raises a StopIteration
+    when the DataLoader is exhausted. This is used to signal the end of the
+    data set. Still resets the internal iterator when exhausted, so can
+    be reused.
+    """
+
+    def __next__(self):
+        try:
+            batch = next(self.data_iterator)
+        except StopIteration:
+            self.data_iterator = iter(self.data_loader)
+            raise StopIteration
+
+        return batch
+
+
+
+def build_data_loaders(replay_memory: Dataset, collate_func: Callable,
+                       config: dict, train_workers: int = 1,
+                       train_prefetch: int = 1, val_workers: int = 0,
+                       val_prefetch: int = 1, drop_last: bool = False,
+                       shuffle: bool = True
+                       ) -> tuple[DataLoader, DataLoader | None]:
+
     train_split = config["train_split"]
 
     if train_split < 1.0:
@@ -65,3 +118,62 @@ def build_data_loaders(replay_memory, collate_func, config,
         val_loader = None
 
     return train_loader, val_loader
+
+
+def build_infinte_data_iterators(
+        replay_memory: Dataset, collate_func: Callable, config: dict,
+        train_workers: int = 1, train_prefetch: int = 1,
+        val_workers: int = 0, val_prefetch: int = 1,
+        drop_last: bool = False, shuffle: bool = True,
+        full_set_training: bool = False, full_set_eval: bool = False
+        ) -> tuple[InfiniteDataIterator, InfiniteDataIterator]:
+
+    train_loader, val_loader = build_data_loaders(
+        replay_memory, collate_func, config, train_workers, train_prefetch,
+        val_workers, val_prefetch, drop_last, shuffle)
+
+    if full_set_training:
+        train_iterator = ReplenishingDataIterator(train_loader)
+    else:
+        train_iterator = AutoResettingDataIterator(train_loader)
+
+    if val_loader is None:
+        val_iterator = None
+    elif full_set_eval:
+        val_iterator = ReplenishingDataIterator(val_loader)
+    else:
+        val_iterator = AutoResettingDataIterator(val_loader) if val_loader \
+            else None
+
+    return train_iterator, val_iterator
+
+
+img_to_tensor = torchvision.transforms.ToTensor()
+
+
+def load_image(path, crop=None):
+    # crop: left, right, top, bottom
+    image = Image.open(path)
+    tens = img_to_tensor(image)
+    if crop is not None:
+        l, r, t, b = crop
+        tens = tens[:, t:b][:, :, l:r].contiguous()
+    return tens
+
+
+def load_tensor(path, crop=None):
+    # crop: left, right, top, bottom
+    tens = torch.load(path)
+    if crop is not None:
+        l, r, t, b = crop
+        tens = tens[t:b][:, l:r].contiguous()
+    return tens
+
+
+def save_image(tens, path):
+    return torchvision.utils.save_image(tens, path)
+
+
+def save_tensor(tens, path):
+    tens = tens.to('cpu') if tens is not None else tens
+    return torch.save(tens, path)

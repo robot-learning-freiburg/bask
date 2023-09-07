@@ -1,17 +1,12 @@
 import math
-from abc import ABC
+from abc import ABC, abstractmethod
 from collections import deque
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils.geometry import euler_to_quaternion
-
-# NOTE: these values are used to fit the labels (actions) of expert policies as
-# closely into [-1,1] as possible to improve learning performance. To decide
-# the values, inspect the dataset and look at min and max of the action distr.
-trans_scale = 50
-rot_scale = 12.5
+from utils.geometry import euler_to_quaternion_np, normalize_quaternion
+from utils.observation import SceneObservation
 
 
 def squash(array, ord=20):
@@ -23,52 +18,77 @@ def squash(array, ord=20):
 class GripperPlot:
     def __init__(self, headless):
         self.headless = headless
+
         if headless:
             return
+
         self.displayed_gripper = 0.9
+
         self.fig = plt.figure()
+
         ax = self.fig.add_subplot(111)
         ax.set_xlim(-1.25, 1.25)
         ax.set_ylim(-1.25, 1.25)
+
         horizontal_patch = plt.Rectangle((-1, 0), 2, 0.6)
         self.left_patch = plt.Rectangle((-0.9, -1), 0.4, 1, color="black")
         self.right_patch = plt.Rectangle((0.5, -1), 0.4, 1, color="black")
+
         ax.add_patch(horizontal_patch)
         ax.add_patch(self.left_patch)
         ax.add_patch(self.right_patch)
+
         self.fig.canvas.draw()
+
         plt.show(block=False)
+
         plt.pause(0.1)
+
         for _ in range(2):
             self.set_data(0)
             plt.pause(0.1)
             self.set_data(1)
             plt.pause(0.1)
-        return
 
-    def set_data(self, last_gripper_open):
-        if self.headless:
+
+    def set_data(self, new_state: float) -> None:
+        """
+        Set the gripper plot to the given gripper state.
+
+        Parameters
+        ----------
+        new_state : float
+            The new gripper state, either 0.9 (open) or -0.9 (closed).
+        """
+        if self.headless or self.displayed_gripper == new_state:
             return
-        if self.displayed_gripper == last_gripper_open:
-            return
-        if last_gripper_open == 0.9:
+
+        if new_state == 0.9:
             self.displayed_gripper = 0.9
             self.left_patch.set_xy((-0.9, -1))
             self.right_patch.set_xy((0.5, -1))
-        elif last_gripper_open == -0.9:
+
+        elif new_state == -0.9:
             self.displayed_gripper = -0.9
             self.left_patch.set_xy((-0.4, -1))
             self.right_patch.set_xy((0, -1))
+
         self.fig.canvas.draw()
+
         plt.pause(0.01)
+
         return
 
-    def reset(self):
+    def reset(self) -> None:
         self.set_data(1)
 
 
 class BaseEnvironment(ABC):
     def __init__(self, config):
+        self.do_postprocess_actions = True
+        self.do_scale_action = config["scale_action"]
+        self.do_delay_gripper = config["delay_gripper"]
+
         if "image_size" in config and config["image_size"] is not None:
             image_size = config["image_size"]
         else:
@@ -76,120 +96,170 @@ class BaseEnvironment(ABC):
 
         self.image_height, self.image_width = image_size
 
-        self.gripper_plot = GripperPlot(not config["viz"])
+        self.gripper_plot = GripperPlot(not config["gripper_plot"])
         self.gripper_open = 0.9
-        self.gripper_deque = deque([0.9] * 4, maxlen=4)
+
+        self.queue_length = 4
+        self.gripper_deque = deque([0.9] * self.queue_length,
+                                   maxlen=self.queue_length)
 
         # Scale actions from [-1,1] to the actual action space, ie transtions
         # in meters etc.
         self._delta_pos_scale = 0.01
         self._delta_angle_scale = 0.04
 
-    def reset(self):
-        self.gripper_plot.reset()
-        self.gripper_open = 0.9
-        self.gripper_deque = deque([0.9] * 4, maxlen=4)
+    def reset(self) -> None:
+        """
+        Reset the environment to a new episode. In the BaseEnvironment, this
+        only resets the gripper plot.
+        """
+        if self.gripper_plot:
+            self.gripper_plot.reset()
 
-    def step(self, action, manual_demo=False):
+        self.gripper_open = 0.9
+        self.gripper_deque = deque([0.9] * self.queue_length,
+                                   maxlen=self.queue_length)
+
+    def step(self, action: np.ndarray
+             ) -> tuple[SceneObservation, float, bool, dict]:
+        """
+        Postprocess the action and execute it in the environment.
+        Simple wrapper around _step, that provides the kwargs for
+        postprocessing from self.config.
+
+        Parameters
+        ----------
+        action : np.ndarray
+            The raw action predicted by a policy.
+
+        Returns
+        -------
+        tuple[SceneObservation, float, bool, dict]
+            The observation, reward, done flag and info dict.
+        """
+
+        return self._step(action, postprocess=self.do_postprocess_actions,
+                          delay_gripper=self.do_delay_gripper,
+                          scale_action=self.do_scale_action)
+
+    @abstractmethod
+    def _step(self, action: np.ndarray, postprocess: bool = True,
+             delay_gripper: bool = True, scale_action: bool = True,
+             *args) -> tuple[SceneObservation, float, bool, dict]:
+        """
+        Postprocess the action and execute it in the environment.
+        """
         raise NotImplementedError
 
-    def render(self):
+    def render(self) -> None:
+        """
+        Explicit render function for simulated environments.
+        In the BaseEnvironment, this does nothing.
+        """
         return
 
+    @abstractmethod
     def close(self):
+        """
+        Gracefully close the environment.
+        """
         raise NotImplementedError
 
-    def postprocess_action(self, action, manual_demo=False, return_euler=False):
-        if manual_demo:
-            delta_position = action[:3] * self._delta_pos_scale
-            euler = action[3:6] * self._delta_angle_scale
-            if return_euler:
-                rot = euler
-            else:
-                delta_angle_quat = euler_to_quaternion(euler)
-                rot = normalize(np.array(delta_angle_quat))
-            gripper_delayed = self.delay_gripper(action[-1])
+    def postprocess_action(self, action: np.ndarray[(7,), np.float32],
+                           scale_action: bool = False,
+                           delay_gripper: bool = False,
+                           return_euler: bool = False,
+                           trans_scale: float | None = None,
+                           rot_scale: float | None = None) -> np.ndarray:
+        """
+        Postprocess the action predicted by the policy for the action space of
+        the environment.
+
+        Parameters
+        ----------
+        action : np.ndarray[(7,), np.float32]
+            Original action predicted by the neural network.
+            Concatenation of delta_position, delta_rot_euler, gripper action.
+        scale_action : bool, optional
+            Whether to scale the position and rotation action, by default False
+        delay_gripper : bool, optional
+            Whether to delay the gripper, by default False
+        return_euler : bool, optional
+            Whether to return the rotation part as Euler angles or quaternions,
+            by default False
+        trans_scale : float | None, optional
+            The scaling for the translation action,
+            by default self._delta_pos_scale
+        rot_scale : float | None, optional
+            The scaling for the rotation (applied to the Euler angles),
+            by default self._delta_angle_scale
+
+        Returns
+        -------
+        np.ndarray
+            _description_
+        """
+
+        if trans_scale is None:
+            trans_scale = self._delta_pos_scale
+        if rot_scale is None:
+            rot_scale = self._delta_angle_scale
+
+        delta_position, delta_rot_euler, gripper = np.split(action, [3, 6])
+
+        if scale_action:
+            delta_position = delta_position * trans_scale
+            delta_rot_euler = delta_rot_euler * rot_scale
+
+        if return_euler:
+            delta_rot = delta_rot_euler
         else:
-            action[:3] /= trans_scale
-            action[3:6] /= rot_scale
-            # action[:6] = squash(action[:6])
+            delta_rot = euler_to_quaternion_np(delta_rot_euler)
+            delta_rot = normalize_quaternion(delta_rot)
 
-            delta_position = action[:3]
-            euler = action[3:6]
-            if return_euler:
-                rot = euler
-            else:
-                rot = euler_to_quaternion(euler)
-            gripper_delayed = action[-1]
+        if delay_gripper:
+            gripper = self.delay_gripper(gripper)
 
-        action_post = np.concatenate(
-            (delta_position, rot, [gripper_delayed]))
+        return np.concatenate((delta_position, delta_rot, [gripper]))
 
-        return action_post
+    def delay_gripper(self, gripper_action: float) -> float:
+        """
+        Delay gripper action, ie. only open/close gripper if the gripper action
+        is constant over the last few steps (self.queue_length).
+        Useful to smooth noisy gripper actions predicted by neural networks.
 
-    def delay_gripper(self, gripper_action):
+        Parameters
+        ----------
+        gripper_action : float
+            The current gripper action.
+
+        Returns
+        -------
+        float
+            The smoothed/delayed gripper action.
+        """
         if gripper_action >= 0.0:
             gripper_action = 0.9
         elif gripper_action < 0.0:
             gripper_action = -0.9
+
         self.gripper_plot.set_data(gripper_action)
         self.gripper_deque.append(gripper_action)
+
         if all([x == 0.9 for x in self.gripper_deque]):
             self.gripper_open = 1
+
         elif all([x == -0.9 for x in self.gripper_deque]):
             self.gripper_open = 0
+
         return self.gripper_open
 
-    def obs_split(self, obs):
-        raise NotImplementedError
+    def update_visualization(self, info: dict) -> None:
+        """
+        Update additional visualizations hosted by the environment.
+        Currently only used by franka env. And even that is a bit of a hack.
 
-
-def unit_vector(data, axis=None, out=None):
-    """Return ndarray normalized by length, i.e. Euclidean norm, along axis.
-    """
-    if out is None:
-        data = np.array(data, dtype=np.float64, copy=True)
-        if data.ndim == 1:
-            data /= math.sqrt(np.dot(data, data))
-            return data
-    else:
-        if out is not data:
-            out[:] = np.array(data, copy=False)
-        data = out
-    length = np.atleast_1d(np.sum(data*data, axis))
-    np.sqrt(length, length)
-    if axis is not None:
-        length = np.expand_dims(length, axis)
-    data /= length
-    if out is None:
-        return data
-
-
-def quaternion_slerp(quat0, quat1, fraction, spin=0, shortestpath=True):
-    """Return spherical linear interpolation between two quaternions.
-    """
-    _EPS = np.finfo(float).eps * 4.0
-    q0 = unit_vector(quat0[:4])
-    q1 = unit_vector(quat1[:4])
-    if fraction == 0.0:
-        return q0
-    elif fraction == 1.0:
-        return q1
-    d = np.dot(q0, q1)
-    if abs(abs(d) - 1.0) < _EPS:
-        return q0
-    if shortestpath and d < 0.0:
-        # invert rotation
-        d = -d
-        np.negative(q1, q1)
-    angle = math.acos(d) + spin * math.pi
-    if abs(angle) < _EPS:
-        return q0
-    isin = 1.0 / math.sin(angle)
-    q0 *= math.sin((1.0 - fraction) * angle) * isin
-    q1 *= math.sin(fraction * angle) * isin
-    q0 += q1
-    return q0
-
-def normalize(quat):
-    return quat / np.sqrt(np.sum(quat**2))
+        TODO Should move this outside of the environment class or use it more
+        consistently.
+        """
+        pass

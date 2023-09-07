@@ -8,77 +8,90 @@ from tqdm.auto import tqdm
 import config as default_config
 import utils.logging  # noqa
 from dataset.bc import BCDataset
-from dataset.dataclasses import collate_bc
-from encoder import encoder_switch
-from utils.constants import MaskTypes
+from encoder import encoder_names, encoder_switch
+from encoder.representation_learner import RepresentationLearner
 from utils.data_loading import build_data_loaders
 from utils.misc import (apply_machine_config, import_config_file,
-                        load_replay_memory, pretrain_checkpoint_name,
-                        set_seeds)
+                        load_replay_memory, pretrain_checkpoint_name)
+from utils.observation import MaskTypes, collate
+from utils.random import configure_seeds
 from utils.select_gpu import device
-
-# from utils.tasks import tasks
 
 
 @torch.no_grad()  # otherwise there's a memory leak somwhere. shoulf fix!
-def embed_trajectories(encoder, replay_memory, config, encoder_name):
+def embed_trajectories(encoder: RepresentationLearner, replay_memory: BCDataset,
+                       config: dict, encoder_name: str) -> None:
 
-    collate_func = collate_bc  # works as we don't need padding for bs=1.
+    collate_func = collate  # works as we don't need padding for bs=1.
 
-    train_loader, _ = build_data_loaders(replay_memory,
-                                         collate_func,
+    train_loader, _ = build_data_loaders(replay_memory, collate_func,
                                          config['dataset_config'],
                                          shuffle=False)
-    train_generator = iter(train_loader)
+    train_iterator = iter(train_loader)
 
-    cam_names = config["dataset_config"]["cams"]
+    cam_names = config["dataset_config"]["cameras"]
     n_cams = len(cam_names)
 
-    logger.info("Beginning training.")
-    for traj_no, batch in tqdm(enumerate(train_generator)):
+    logger.info("Beginning embedding.")
+
+    for traj_no, batch in tqdm(enumerate(train_iterator)):
         batch = batch.to(device)
 
-        for step, obs in tqdm(enumerate(batch), leave=False):
+        time_steps = batch.shape[1]
+
+        for step in tqdm(range(time_steps), leave=False):
+
+            obs = batch[:, step, ...]
+            embedding, info = encoder.encode(obs)
+
             if config["policy_config"]["encoder"] == "keypoints":
-                encoding, info = encoder.encode(obs.cam_rgb, full_obs=obs)
 
-                embedding = (e.squeeze(0).detach() for e in info["descriptor"])
-
-                for i, cn, e in zip(range(n_cams), cam_names, embedding):
-
-                    replay_memory.add_embedding(traj_no, step, cn,
-                                                "descriptor", e,
-                                                encoder_name)
+                save_descriptor(replay_memory, encoder_name, cam_names,
+                                traj_no, step, info)
 
             else:
-                embedding, info = encoder.encode(obs.cam_rgb, full_obs=obs)
-                embedding = embedding.squeeze(0).detach().chunk(n_cams, -1)
+                save_encoding(replay_memory, config, encoder_name, cam_names,
+                              n_cams, traj_no, step, embedding, info)
 
-                if config["policy_config"]["encoder"] == "transporter":
-                    heatmaps = [h.squeeze(0).detach().cpu()
-                                for h in info["heatmap"]]
+def save_encoding(replay_memory: BCDataset, config: dict, encoder_name:str,
+                  cam_names: tuple[str], n_cams: int, traj_no: int,
+                  obs_no: int, embedding: torch.Tensor, info: dict) -> None:
 
-                for i, cn, e in zip(range(n_cams), cam_names, embedding):
+    cam_embeddings = embedding.squeeze(0).detach().chunk(n_cams, -1)
 
-                    replay_memory.add_embedding(traj_no, step, cn,
-                                                "descriptor", e,
-                                                encoder_name)
-                    if config["policy_config"]["encoder"] == "transporter":
+    if config["policy_config"]["encoder"] == "transporter":
+        heatmaps = [h.squeeze(0).detach().cpu() for h in info["heatmap"]]
 
-                        replay_memory.add_embedding(traj_no, step, cn,
-                                                    "heatmap", heatmaps[i],
-                                                    encoder_name)
+    for i, cn, e in zip(range(n_cams), cam_names, cam_embeddings):
+        replay_memory.add_embedding(traj_no, obs_no, cn, "descriptor", e,
+                                    encoder_name)
+
+        if config["policy_config"]["encoder"] == "transporter":
+            replay_memory.add_embedding(traj_no, obs_no, cn, "heatmap",
+                                        heatmaps[i], encoder_name)
 
 
-def main(config, path=None, copy_selection_from=None):
-    replay_memory = load_replay_memory(config["dataset_config"],
-                                       path=path)
+def save_descriptor(replay_memory: BCDataset, encoder_name: str,
+                    cam_names: tuple[str], traj_no: int, obs_no: int,
+                    info: dict) -> None:
+
+    descriptor = (e.squeeze(0).detach() for e in info["descriptor"])
+
+    for cn, d in zip(cam_names, descriptor):
+        replay_memory.add_embedding(traj_no, obs_no, cn, "descriptor", d,
+                                    encoder_name)
+
+
+def main(config: dict, path: str | None = None,
+         copy_selection_from: str | None = None) -> None:
+
+    replay_memory = load_replay_memory(config["dataset_config"], path=path)
+    replay_memory.update_camera_crop(config["dataset_config"]["image_crop"])
+
     replay_memory = BCDataset(replay_memory, config['dataset_config'])
 
     Encoder = encoder_switch[config["policy_config"]["encoder"]]
     encoder = Encoder(config["policy_config"]["encoder_config"]).to(device)
-                    #   image_size=(replay_memory.scene_data.image_height,
-                    #               replay_memory.scene_data.image_width)).to(
 
     file_name = pretrain_checkpoint_name(config)
     encoder.from_disk(file_name)
@@ -100,13 +113,8 @@ def main(config, path=None, copy_selection_from=None):
                          'ref_object_pose', 'ref_depth', 'ref_int', 'ref_ext']:
                 setattr(encoder, attr, state_dict[attr].to(device))
         else:
-            init_encoder = getattr(encoder,
-                                   "initialize_parameters_via_dataset", None)
-            if callable(init_encoder):
-                init_encoder(replay_memory)
-            else:
-                logger.info("This encoder does not use dataset initialization."
-                            )
+            encoder.initialize_parameters_via_dataset(
+                replay_memory, config["dataset_config"]["cameras"][0])
 
     encoder.eval()
 
@@ -120,107 +128,70 @@ def main(config, path=None, copy_selection_from=None):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "-f",
-        "--feedback_type",
-        dest="feedback_type",
-        default="cloning_10",
-        help="options: cloning_10, cloning_200",
+        "-t", "--task",
+        help="Name of the task from which to load the data.",
     )
     parser.add_argument(
-        "-t",
-        "--task",
-        dest="task",
-        default="CloseMicrowave",
-        # help="options: {}, 'Mixed'".format(str(tasks)[1:-1]),
-    )
-    parser.add_argument(
-        "--pretrained_on",
-        dest="pretrained_on",
-        default=None,
-        help="task on which the encoder was pretrained, "
-            #  "options: {}, 'Mixed'".format(str(tasks)[1:-1]),
-    )
-    parser.add_argument(
-        "--pretrain_feedback",
-        dest="pretrain_feedback",
-        default=None,
-        help="The data on which the model was pretrained, eg. dcs_20",
-    )
-    parser.add_argument(
-        "-e",
-        "--encoder",
-        dest="encoder",
-        default=None,
-        help="options: transporter, bvae, monet, keypoints"
-    )
-    parser.add_argument(
-        "-m",
-        "--mask",
-        dest="mask",
-        action="store_true",
-        default=False,
-        help="Use data with ground truth object masks.",
+        "-f", "--feedback_type",
+        default="demos",
+        help="Name of data type to load.",
     )
     parser.add_argument(
         "--path",
-        dest="path",
         default=None,
-        help="Path to a dataset. May be provided instead of f-t-m.",
+        help="Path to a dataset. May be provided instead of f-t.",
     )
     parser.add_argument(
-        "-c",
-        "--config",
-        dest="config",
+        "--pretrained_on",
         default=None,
-        help="Config file to use. Uses default if None provided.",
+        help="Task on which the encoder was pretrained. Defaults to task. "
     )
     parser.add_argument(
-        "-s",
-        "--seed",
-        dest="seed",
+        "--pretrain_feedback",
+        default='pretrain_manual',
+        help="The data on which the model was pretrained.",
+    )
+    parser.add_argument(
+        "-e", "--encoder",
         default=None,
-        help="Specify random seed for fair evalaution."
+        help=f"Options: {str(encoder_names)[1:-1]}"
     )
     parser.add_argument(
         "--encoder_suffix",
-        dest="encoder_suffix",
         default=None,
         help="Pass a suffix to append to the name of the encoder checkpoint."
     )
     parser.add_argument(
-        "--cam",
-        dest="cam",
-        required=True,
-        nargs='+',
-        help="The camera(s) to use. Options: wrist, overhead."
+        "-c", "--config",
+        default=None,
+        help="Config file to use. Uses default if None provided.",
     )
     parser.add_argument(
-        "-o",
-        "--object_pose",
-        dest="object_pose",
-        action="store_true",
-        default=False,
-        help="Use data with ground truth object positions.",
+        "-s", "--seed",
+        default=None,
+        help="Specify random seed for fair evalaution."
+    )
+    parser.add_argument(
+        "--cam",
+        required=True,
+        nargs='+',
+        help="The camera(s) to use. Options: wrist, overhead, ..."
     )
     parser.add_argument(
         "--copy_selection_from",
-        dest="copy_selection_from",
         required=False,
         help="Path to an encoder from which to copy the reference uvs, vecs."
              "For GT-KP model only (to compare different projections)."
     )
     parser.add_argument(
         "--panda",
-        dest="panda",
         action="store_true",
         default=False,
         help="Data comes from a real world panda -> 480px obs.",
     )
     args = parser.parse_args()
 
-    seed = int(args.seed) if args.seed else random.randint(0, 2000)
-    logger.info("Seed: {}", seed)
-    set_seeds(seed)
+    seed = configure_seeds(args)
 
     if args.config is not None:
         logger.info("Using config {}", args.config)
@@ -238,23 +209,20 @@ if __name__ == "__main__":
         policy_config = default_config.policy_config
 
     encoder_for_conf = args.encoder or "dummy"
-    if encoder_for_conf == "keypoints_var":
-        encoder_for_conf = "keypoints"
 
-    # mask_type = MaskTypes.GT if args.mask or args.object_pose else \
-    #     MaskTypes.TSDF
-    mask_type = None if args.panda else MaskTypes.GT  # only needed for GT_KP model anyway.
+    # only needed for GT_KP model anyway.
+    mask_type = None if args.panda else MaskTypes.GT
 
     if args.encoder == "keypoints_gt" and len(args.cam) > 1:
         logger.error("Should only use one camera for GT KP encoder.")
         exit(1)
 
-    image_dim = (480, 480) if args.panda else (256, 256)
+    image_dim = default_config.realsense_cam_resolution_cropped if args.panda \
+        else default_config.sim_cam_resolution
+    image_crop = default_config.realsense_cam_crop if args.panda else None
 
     selected_encoder_config = encoder_configs[encoder_for_conf]
-    selected_encoder_config["obs_config"] = {
-        "image_dim": image_dim
-    }
+    selected_encoder_config["obs_config"] = {"image_dim": image_dim}
 
     config = {
         "training_config": {
@@ -272,8 +240,6 @@ if __name__ == "__main__":
             "feedback_type": args.feedback_type,
             "task": args.task,
 
-            "ground_truth_mask": args.mask or args.object_pose,
-            "ground_truth_object_pose": args.object_pose,
             # strictly, the next two keys are encoder-attributes, but we only
             # need them for checkpoint loading, so keep them here instead.
             "pretrained_on": args.pretrained_on or args.task,
@@ -285,9 +251,14 @@ if __name__ == "__main__":
 
             "mask_type": mask_type,
 
-            "cams": args.cam,
+            "cameras": tuple(args.cam),
+            "image_crop": image_crop,
+
+            "force_load_raw": True,
 
             "sample_freq": None,  # downsample the trajectories to this freq
+
+            "only_use_labels": [13],
 
             "data_root": "data",
 
@@ -302,9 +273,5 @@ if __name__ == "__main__":
         raise ValueError("Please specify the desired encoder type.")
 
     config = apply_machine_config(config)
-
-    # if config["policy_config"]["encoder_config"].get("encoder", {}).get(
-    #         "prior_type") is PriorTypes.PARTICLE_FILTER:
-    #     config["dataset_config"]["force_load_raw"] = True
 
     main(config, args.path, args.copy_selection_from)

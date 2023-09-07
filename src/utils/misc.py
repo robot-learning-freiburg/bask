@@ -12,61 +12,44 @@ import numpy as np
 import torch
 from loguru import logger
 
-# from utils.tasks import task_switch
+from utils.logging import indent_logs
 
+
+def invert_dict(dictionary):
+    return {v: k for k, v in dictionary.items()}
 
 def random_string(str_len=8):
     alphabet = string.ascii_lowercase + string.digits
     return ''.join(random.choices(alphabet, k=str_len))
 
 
-file_name_roots = {
-    "cloning": "demos",
-    "dc": "densecorr",
-    "dcr": "densecorr_random",
-    "dcm": "densecorr_manual",
-    "dcs": "densecorr_sphere",
-    "ed": "expert_demos",
-}
+def get_full_task_name(config):
+    task_name = config["env_config"]["task"]
 
-is_manual_demo = {
-    "cloning": True,
-    "ed": False,
-}
+    if config["env_config"]["background"]:
+        task_name += "-" + config["env_config"]["background"]
+
+    task_name += "-" + "_".join([m for m in config["env_config"]["model_ids"]])
+
+    return task_name
 
 
-def get_is_manual_demo(config):
-    feedback_type = config["dataset_config"]["feedback_type"]
-    root = feedback_type.split("_")[0]  # root, number or just root
-    if root in is_manual_demo.keys():
-        return is_manual_demo[root]
+def get_dataset_name(config):
+    if config["dataset_config"]["pretraining"]:
+        name = "pretrain_" + config["policy_config"]["policy"].value.lower()
     else:
-        raise ValueError(
-            "Unexpected name of training data {}.".format(feedback_type))
+        name = "demos"
+
+    return name
 
 
-def get_file_name(feedback_type, with_mask=False, with_obj_pose=False):
-    components = feedback_type.split("_")  # root, number or just root
-    num = "_" + components[1] if len(components) == 2 else ""
-    return file_name_roots[components[0]] + num + ("_gt" if with_obj_pose
-                                                   else"_mm" if with_mask
-                                                   else "")
-
-
-# TODO: use root-conf also in other funcs
 def get_data_path(config, task, root=None):
     if root is None:
         root = "data"
-    with_ground_truth_mask = config.get("ground_truth_mask")
-    with_ground_truth_pose = config.get("ground_truth_object_pose")
-    file_name = get_file_name(config["feedback_type"], with_ground_truth_mask,
-                              with_ground_truth_pose)
+
+    file_name = config["feedback_type"]
+
     return root + "/" + task + "/" + file_name
-
-
-def get_fusion_dir(config):
-    return "data/" + config["task"] + "/" + get_file_name(
-        config["feedback_type"])
 
 
 def load_replay_memory(config, path=None):
@@ -74,69 +57,35 @@ def load_replay_memory(config, path=None):
 
     logger.info("Loading dataset(s): ")
 
-    if path:
-        memory = dataset.scene.SceneDataset(data_root=pathlib.Path(path))
-    else:
-        task = config["task"]
-        if task == "Mixed":
-            # task = task_switch.keys()
-            raise NotImplementedError(
-                "Disabled to avoid QT mixup between CoppeliaSim and ROS.")
+    with indent_logs():
+        if path:
+            memory = dataset.scene.SceneDataset(data_root=pathlib.Path(path))
         else:
-            task = [task]
+            task = config["task"]
+            if task == "Mixed":
+                # task = task_switch.keys()
+                raise NotImplementedError(
+                    "Disabled to avoid QT mixup between CoppeliaSim and ROS.")
+            else:
+                task = [task]
 
-        data = []
+            data = []
 
-        for t in task:
-            data_path = pathlib.Path(get_data_path(
-                config, t, root=config["data_root"]))
-            dset = dataset.scene.SceneDataset(
-                data_root=data_path,
-                ground_truth_object_pose=config['ground_truth_object_pose'])
-            data.append(dset)
+            for t in task:
+                data_path = pathlib.Path(get_data_path(
+                    config, t, root=config["data_root"]))
+                dset = dataset.scene.SceneDataset(data_root=data_path)
+                data.append(dset)
 
-        memory = dataset.scene.SceneDataset.join_datasets(*data)
+            memory = dataset.scene.SceneDataset.join_datasets(*data)
 
-    logger.info("  Done! Data contains {} trajectories.", len(memory))
-
-    return memory
-
-
-# TODO: unify with normal load_replay_memory
-def load_replay_memory_from_path(data_path):
-    import dataset.scene
-
-    data_path = pathlib.Path(data_path)
-    logger.info("Loading dataset(s): ")
-
-    if data_path.is_dir():
-        logger.info(
-            "  Data path is a dir. Creating mulifile set with:")
-        load_paths = sorted(list(data_path.rglob('*.dat')))
-        for p in load_paths:
-            logger.info("    {}", p)
-        memory = dataset.multifile.MultiFileSet(load_paths)
-    else:
-        logger.info("  {}", data_path)
-        memory = torch.load(data_path)
-        if type(memory) == dataset.scene.SceneDataset:
-            # TODO: these were hacks for old data. Can removed now!
-            memory.patch_missing_members()
-
-    logger.info("  Done! Data contains {} trajectories.", len(memory))
+        logger.info("Done! Data contains {} trajectories.", len(memory))
 
     return memory
 
 
-def save_replay_memory(replay_memory, config):
-    file_name = get_data_path(config, config["task"])
-    logger.info("Saving dataset: ")
-    logger.info("  {}", file_name)
-    torch.save(replay_memory, file_name)
-    logger.info("Done!")
-
-
-def policy_checkpoint_name(config, create_suffix=False):
+def policy_checkpoint_name(config: dict, create_suffix: bool =False
+                           ) -> tuple[str, str]:
     if create_suffix and config["policy_config"].get("suffix"):
         raise ValueError("Should not pass suffix AND ask to create one.")
     if (pt := config["dataset_config"].get("pretrained_on", None)) is not None:
@@ -169,8 +118,6 @@ def pretrain_checkpoint_name(config):
     suffix = config["policy_config"].get("encoder_suffix")
     suffix = "-" + suffix if suffix else ""
     encoder = config["policy_config"]["encoder"]
-    if encoder == "keypoints_var":
-        encoder = "keypoints"
     encoder_name = feedback + "_" + encoder + "_encoder" + suffix
     return (pathlib.Path(config["dataset_config"]["data_root"]) / task /
             encoder_name).with_suffix(".pt")
@@ -195,14 +142,6 @@ def loop_sleep(start_time, dt=0.05):
     if sleep_time > 0.0:
         time.sleep(sleep_time)
     return
-
-
-def set_seeds(seed=0):
-    """Sets all seeds."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
 
 
 def import_config_file(config_file):
@@ -280,6 +219,13 @@ def configure_class_instance(instance, class_keys, config):
             v = False
         setattr(instance, k, v)
 
+
+def get_and_log_failure(dictionary, key, default=None):
+    if key in dictionary:
+        return dictionary[key]
+    else:
+        logger.info("Key {} not in config. Assuming {}.", key, default)
+        return default
 
 def multiply_iterable(l):
     return reduce(lambda x, y: x*y, l)

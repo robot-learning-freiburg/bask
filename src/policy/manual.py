@@ -1,5 +1,6 @@
 import numpy as np
 
+from env.environment import BaseEnvironment
 from utils.human_feedback import correct_action
 from utils.keyboard_observer import KeyboardObserver
 
@@ -25,7 +26,7 @@ class ManualPolicy():
             self.gripper_open = action[-1]
         return action, None, None
 
-    def reset_episode(self, env):
+    def reset_episode(self, env: BaseEnvironment | None = None):
         # TODO: add this to all other policies as well and use it to store
         # the LSTM state as well?
         self.gripper_open = 0.9

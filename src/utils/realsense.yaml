@@ -3,13 +3,13 @@ _recursive_: false
 name: realsense
 fps: 30
 img_type: "rgb_depth"
-resolution: [640, 480]
+resolution: [640, 360]
 # crop_coords: [40, 440, 120, 520]
 params:
   brightness: 3.0
   contrast: 50.0
-  exposure: 41.0
-  gain: 64.0
+  exposure: 33.0
+  gain: 16.0
   gamma: 300.0
   hue: 0.0
   saturation: 64.0

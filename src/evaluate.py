@@ -1,9 +1,7 @@
-import itertools
 import pathlib
 import random
 import time
 from argparse import ArgumentParser
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -12,123 +10,83 @@ from tqdm.auto import tqdm
 
 import utils.logging  # noqa
 import wandb
-from config import camera_pose, encoder_configs
-from policy import policy_switch
-from utils.kp_dist_tracker import KP_Dist_Tracker
+from config import (camera_pose, encoder_configs, realsense_cam_crop,
+                    realsense_cam_resolution_cropped, sim_cam_resolution)
+from encoder import encoder_names
+from env import Environment, get_env, import_env
+from env.environment import BaseEnvironment
+from policy import policy_names, policy_switch
+from policy.policy import Policy
+from utils.keyboard_observer import (KeyboardObserver,
+                                     wait_for_environment_reset)
 from utils.misc import import_config_file  # loop_sleep
-from utils.misc import (apply_machine_config, get_is_manual_demo,
-                        policy_checkpoint_name, set_seeds)
+from utils.misc import apply_machine_config, policy_checkpoint_name
+from utils.observation import SceneObservation, random_obs_dropout
+from utils.random import configure_seeds
 from utils.select_gpu import device
-# from utils.tasks import tasks
+from utils.tasks import get_task_horizon
 from viz.live_keypoint import LiveKeypoints
-
-task_horizons = {
-     "CloseMicrowave": 300,  # i.e. 15 seconds
-     "TakeLidOffSaucepan": 300,
-     "PhoneOnBase": 600,
-     "PutRubbishInBin": 600,
-}
-
-task_horizons = defaultdict(lambda: 300, task_horizons)
-
 
 init_griper_state = 0.9 * torch.ones(1, device=device)
 
 
-def get_task_horizon(config):
-    if config["eval_config"]["panda"]:
-        return None
+def calculate_repeat_action(config, def_freq=20):
+    if config["dataset_config"]["sample_freq"]:
+        repeat_action = int(config["dataset_config"]["sample_correction"]
+                            * def_freq/config["dataset_config"]["sample_freq"])
+        logger.info(
+            "Sample freq {}, correction {}, thus repeating actions {}x.",
+            config["dataset_config"]["sample_freq"],
+            config["dataset_config"]["sample_correction"], repeat_action)
     else:
-        return task_horizons[config["eval_config"]["task"]]
+        repeat_action = 1
+
+    return repeat_action
 
 
-def dropout_single_camera(obs, cam_attributes):
-    for attr in cam_attributes:
-        val = getattr(obs, attr)
-        if val is not None:
-            setattr(obs, attr, np.zeros_like(val))
-
-    return obs
-
-
-# TODO: need to drop out sequence of obs, eg a second, hence 20 obs?
-def random_obs_dropout(obs, p=None, drop_all=False):
-    if p is None:
-        return obs
-
-    attr = (("cam_w_rgb", "cam_w_d"),
-            ("cam_o_rgb", "cam_o_d"),
-            ("cam_r_rgb", "cam_r_d"),
-            ("cam_l_rgb", "cam_l_d"))
-    # attr = (("cam_o_rgb", "cam_o_d"),)
-
-    if drop_all:
-        sample = np.random.binomial(1, p)
-        if sample:
-            for camera_attrs in attr:
-                obs = dropout_single_camera(obs, camera_attrs)
-    else:
-        for camera_attrs in attr:
-            sample = np.random.binomial(1, p)
-            if sample:
-                obs = dropout_single_camera(obs, camera_attrs)
-
-    return obs
-
-
-@logger.contextualize(filter=False)
-def wait_for_environment_reset(env, keyboard_obs):
-    if keyboard_obs is not None:
-        env.reset()
-        logger.info("Waiting for env reset. Confirm via input ...")
-        while True:
-            env.get_obs()
-            time.sleep(0.5)
-            if keyboard_obs.reset_button or keyboard_obs.success:
-                keyboard_obs.reset()
-                break
-
-
-def run_simulation(env, policy, episodes, manual_demo, cam, keypoint_viz=None,
-                   horizon=300, repeat_action=1, fragment_len=-1,
-                   track_kp_dist=False, obs_dropout=None, keyboard_obs=None):
+def run_simulation(env: BaseEnvironment, policy: Policy, episodes: int,
+                   keypoint_viz: LiveKeypoints | None = None,
+                   horizon: int | None = 300, repeat_action: int = 1,
+                   fragment_len: int = -1, obs_dropout: float | None = None,
+                   keyboard_obs: KeyboardObserver | None = None):
 
     successes = 0
 
     time.sleep(10)
 
-    kp_dist_tracker = KP_Dist_Tracker() if track_kp_dist else None
-
-    env.reset()  # extra reset to ensure proper camera placement
+    env.reset()  # extra reset to ensure proper camera placement in RLBench
 
     for episode in tqdm(range(episodes)):
         wait_for_environment_reset(env, keyboard_obs)
 
         episode_reward, episode_length = run_episode(
-            env, keyboard_obs, policy, horizon, keypoint_viz, kp_dist_tracker,
-            obs_dropout, cam, repeat_action, fragment_len, manual_demo)
+            env, keyboard_obs, policy, horizon, keypoint_viz, obs_dropout,
+            repeat_action, fragment_len)
 
         if episode_reward > 0:
             successes += 1
 
-        wandb.log({"reward": episode_reward, "episode": episode,
-                   "eps_lenght": episode_length})
+        wandb.log({
+            "reward": episode_reward,
+            "episode": episode,
+            "eps_lenght": episode_length
+            })
 
         if keypoint_viz is not None:
             keypoint_viz.reset()
 
-    if track_kp_dist:
-        save_path = pathlib.Path("tmp")
-        kp_dist_tracker.aggregate_and_save_episodes(save_path)
-
     success_rate = successes / episodes
     wandb.run.summary["success_rate"] = success_rate
 
+    env.close()
+
     return
 
-def run_episode(env, keyboard_obs, policy, horizon, keypoint_viz,
-                kp_dist_tracker, obs_dropout, cam, repeat_action,
-                fragment_len, manual_demo):
+def run_episode(env: BaseEnvironment, keyboard_obs: KeyboardObserver | None,
+                policy: Policy, horizon: int | None,
+                keypoint_viz: LiveKeypoints | None,
+                obs_dropout: float | None,  repeat_action: int,
+                fragment_len: int) -> tuple[float, int]:
 
     episode_reward = 0
     done = False
@@ -138,23 +96,18 @@ def run_episode(env, keyboard_obs, policy, horizon, keypoint_viz,
     if keyboard_obs is not None:
         keyboard_obs.reset()
 
-    try:
-        policy.encoder.reset_traj()
-    except AttributeError:
-        pass
-
-    if kp_dist_tracker is not None:
-        kp_dist_tracker.add_episode()
+    policy.reset_episode()
 
     action = None
     step_no = 0
 
     pbar = tqdm(total=horizon or 1000)
     while True:
-        action, episode_reward, obs, done, lstm_state = process_step(
-            obs, obs_dropout, policy, action, lstm_state, cam, kp_dist_tracker,
-            repeat_action, keypoint_viz, fragment_len, env, keyboard_obs,
-            manual_demo, horizon, step_no, episode_reward)
+        action, step_reward, obs, done, lstm_state = process_step(
+            obs, obs_dropout, policy, action, lstm_state, repeat_action,
+            keypoint_viz, fragment_len, env, keyboard_obs, horizon, step_no)
+
+        episode_reward += step_reward
 
         if done:
             break
@@ -162,41 +115,46 @@ def run_episode(env, keyboard_obs, policy, horizon, keypoint_viz,
         step_no += 1
         pbar.update(1)
 
-    if kp_dist_tracker is not None:
-        kp_dist_tracker.process_episode()
-
     if keyboard_obs is not None:
         keyboard_obs.reset()
 
     return episode_reward, step_no + 1
 
 
-def process_step(obs, obs_dropout, policy, action, lstm_state, cam,
-                 kp_dist_tracker, repeat_action, keypoint_viz, fragment_len,
-                 env, keyboard_obs, manual_demo, horizon, step_no,
-                 episode_reward):
+def process_step(obs: SceneObservation, obs_dropout: float | None,
+                 policy: Policy, action: np.ndarray | None,
+                 lstm_state: tuple[torch.Tensor, torch.Tensor] | None,
+                 repeat_action: int, keypoint_viz: LiveKeypoints | None,
+                 fragment_len: int, env: BaseEnvironment,
+                 keyboard_obs: KeyboardObserver | None,
+                 horizon: int | None, step_no: int):
     # start_time = time.time()
 
-    # NOTE: could reset lstm state, but found better not to do that
-    # if fragment_len != -1 and step_no % fragment_len == 0:
-    #     lstm_state = None
+    if fragment_len != -1 and step_no % fragment_len == 0:
+        logger.info("Resetting LSTM state.")
+        lstm_state = None
 
     obs = random_obs_dropout(obs, obs_dropout)
 
+    # TODO: still need the case where action is None. But can rewrite else?
     obs.gripper_state = init_griper_state if action is None else \
         action[-1, None]
 
-    action, lstm_state, info = policy.predict(obs, lstm_state, cam=cam)
+    action, lstm_state, info = policy.predict(obs, lstm_state)
 
-    if kp_dist_tracker is not None:
-        kp_dist_tracker.add_step(info)
+    assert repeat_action > 0
+
+    step_reward = 0
+    done = False
 
     for _ in range(repeat_action):
 
         if keypoint_viz is not None:
             keypoint_viz.update_from_info(info, obs)
 
-        next_obs, reward, done = env.step(action, manual_demo=manual_demo)
+        next_obs, reward, done, env_info = env.step(action)
+
+        step_reward += reward
 
         if step_no == horizon:
             done = True
@@ -211,76 +169,51 @@ def process_step(obs, obs_dropout, policy, action, lstm_state, cam,
             else:
                 reward = 0
 
-            env.update_viz(obs.cam_w_rgb, info['vis_encoding'][0])  # HACK
+        env.update_visualization(info)
 
         obs = next_obs
-        episode_reward += reward
 
         # loop_sleep(start_time)
 
         if done:
             break
 
-    return action, episode_reward, obs, done, lstm_state
+    return action, step_reward, obs, done, lstm_state
 
 
-def main(config, raw_config, refine_path=None):
-    if config["eval_config"]["panda"]:
-        from env.franka import FrankaEnv as Env
-        from utils.keyboard_observer import KeyboardObserver
+def main(config):
+    Env = import_env(config)
+
+    if config["env_config"]["env"] is Environment.PANDA:
+        # from utils.keyboard_observer import KeyboardObserver
         keyboard_obs = KeyboardObserver()
     else:
-        from env.ground_truth import GTEnv as Env
         keyboard_obs = None
 
     Policy = policy_switch[config["policy_config"]["policy"]]
-    policy = Policy(raw_config["policy_config"]).to(device)
-    file_name, _ = policy_checkpoint_name(raw_config)
+    policy = Policy(config["policy_config"]).to(device)
+
+    file_name, _ = policy_checkpoint_name(config)
     logger.info("Loading policy checkpoint from {}", file_name)
     policy.from_disk(file_name)
-    # HACK: hotfix. TODO: do this properly
-    if refine_path is not None:
-        try:
-            policy.encoder.particle_filter.ref_pixel_world = \
-                torch.load(refine_path)['ref_pixel_world']
-        except Exception as e:
-            raise e
     policy.eval()
 
     logger.info("Creating env.")
-    env = Env(raw_config["eval_config"], eval=True)
+    env = Env(config["env_config"])
 
-    manual_demo = get_is_manual_demo(config)
-    logger.info("Using postprocessing for manual demo: {}", manual_demo)
-
-    keypoint_viz = LiveKeypoints.setup_from_conf(raw_config, policy)
-
-    if config["policy_config"]["encoder"] == "keypoints_var":
-        track_kp_dist = True
-        logger.info("Tracking keypoint distances.")
-    else:
-        track_kp_dist = False
+    keypoint_viz = LiveKeypoints.setup_from_conf(config, policy)
 
     task_horizon = get_task_horizon(config)
 
-    if config["dataset_config"]["sample_freq"]:
-        repeat_action = int(config["dataset_config"]["sample_correction"]
-                            * 20/config["dataset_config"]["sample_freq"])
-        logger.info(
-            "Sample freq {}, correction {}, thus repeating actions {}x.",
-            config["dataset_config"]["sample_freq"],
-            config["dataset_config"]["sample_correction"], repeat_action)
-    else:
-        repeat_action = 1
+    repeat_action = calculate_repeat_action(config)
 
     logger.info("Running simulation.")
 
-    run_simulation(env, policy, config["eval_config"]["episodes"], manual_demo,
-                   config["dataset_config"]["cams"],
-                   keypoint_viz=keypoint_viz, horizon=task_horizon,
+    run_simulation(env, policy, config["eval_config"]["episodes"],
+                   keypoint_viz=keypoint_viz,
+                   horizon=task_horizon,
                    repeat_action=repeat_action,
                    fragment_len=config["dataset_config"]["fragment_length"],
-                   track_kp_dist=track_kp_dist,
                    obs_dropout=config["eval_config"]["obs_dropout"],
                    keyboard_obs=keyboard_obs)
     return
@@ -289,118 +222,83 @@ def main(config, raw_config, refine_path=None):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
-        "-f",
-        "--feedback_type",
-        dest="feedback_type",
-        default="cloning",
-        help="options: cloning",
+        "--environment",
+        default="maniskill",
+        help="RLBench, Maniskill or Panda."
     )
     parser.add_argument(
-        "-t",
-        "--task",
-        dest="task",
+        "-t", "--task",
         default="CloseMicrowave",
-        # help="options: {}, 'Mixed'".format(str(tasks)[1:-1]),
+        help="Name of the task trained on."
+    )
+    # TODO: rename the feedback_type to eg data_type everywhere
+    # And change the confusing name translation business
+    parser.add_argument(
+        "-f", "--feedback_type",
+        default="cloning",
+        help="The training data type. Cloning, dcm, ..."
     )
     parser.add_argument(
         "--pretrained_on",
-        dest="pretrained_on",
         default=None,
-        help="task on which the encoder was pretrained, "
-        #      "options: {}, 'Mixed'".format(str(tasks)[1:-1]),
+        help="The task on which the encoder was pretrained. Defaults to the "
+             "task on which the policy was trained."
     )
     parser.add_argument(
         "--pretrain_feedback",
-        dest="pretrain_feedback",
+        default="pretrain_manual",
+        help="The data type on which the model was pretrained."
+    )
+    parser.add_argument(
+        "-b", "--background",
         default=None,
-        help="The data on which the model was pretrained, eg. dcs_20",
+        help="Maniskill only. Environment background to use."
     )
     parser.add_argument(
-        "-e",
-        "--encoder",
-        dest="encoder",
+        "--model_ids",
+        nargs="+",
+        default=[],
+        help="Maniskill only. Model ids to use for YCB."
+    )
+    parser.add_argument(
+        "-p", "--policy",
+        default="encoder",
+        help=f"Should usually be encoder. Options: {str(policy_names)[1:-1]}"
+    )
+    parser.add_argument(
+        "-e", "--encoder",
         default=None,
-        help="options: transporter, bvae, monet, keypoints"
-    )
-    parser.add_argument(
-        "-p",
-        "--policy",
-        dest="policy",
-        default="ceiling",
-        help="options: ceiling, encoder"
-    )
-    parser.add_argument(
-        "-m",
-        "--mask",
-        dest="mask",
-        action="store_true",
-        default=False,
-        help="Use data with ground truth object masks.",
-    )
-    parser.add_argument(
-        "-d",
-        "--disable_wandb",
-        dest="disable_wandb",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "-s",
-        "--seed",
-        dest="seed",
-        default=None,
-        help="Specify random seed for fair evalaution."
+        help=f"Options: {str(encoder_names)[1:-1]}"
     )
     parser.add_argument(
         "--suffix",
-        dest="suffix",
         default=None,
         help="Pass a suffix to load a specific policy checkpoint."
     )
     parser.add_argument(
         "--bc_step",
-        dest="bc_step",
         default=None,
-        help="Pass a number of an intermediate snapeshot to append to the "
-             "suffix name."
+        help="Pass the number of an intermediate snapeshot to append to the "
+             "policy suffix name."
     )
     parser.add_argument(
-        "-c",
-        "--config",
-        dest="config",
+        "-c", "--config",
         default=None,
         help="Config file to use. Uses default if None provided.",
     )
     parser.add_argument(
         "--cam",
-        dest="cam",
         required=True,
         nargs='+',
-        help="The camera(s) to use. Options: wrist, overhead."
-    )
-    parser.add_argument(
-        "-o",
-        "--object_pose",
-        dest="object_pose",
-        action="store_true",
-        default=False,
-        help="Use data with ground truth object positions.",
-    )
-    parser.add_argument(
-        "-r",
-        "--refine_init",
-        dest="refine_init",
-        default=None,
-        help="Load ref world coordinates from a file for pf init refinement.",
+        help="The camera(s) to use. Options: wrist, overhead, ..."
     )
     parser.add_argument(
         "--obs_dropout",
-        dest="obs_dropout",
+        default=None,
         help="Probability of dropping out an observation. Default: zero.",
     )
     parser.add_argument(
         "--render",
-        dest="render",
         action="store_true",
         default=False,
         help="Render the simulated scene.",
@@ -413,17 +311,21 @@ if __name__ == "__main__":
         help="Disable visualization.",
     )
     parser.add_argument(
-        "--panda",
-        dest="panda",
+        "-d", "--disable_wandb",
         action="store_true",
         default=False,
-        help="Use the real panda robot.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "-s", "--seed",
+        default=None,
+        help="Specify random seed for fair, reproducible evaluation."
+    )
 
-    seed = int(args.seed) if args.seed else random.randint(0, 2000)
-    logger.info("Seed: {}", seed)
-    set_seeds(seed)
+    args = parser.parse_args()
+    env = get_env(args.environment)
+    env_is_panda = env is Environment.PANDA
+
+    seed = configure_seeds(args)
 
     if args.config is not None:
         logger.info("Using config {}", args.config)
@@ -440,50 +342,57 @@ if __name__ == "__main__":
         policy_config = {}
 
     encoder_for_conf = args.encoder or "dummy"
-    if encoder_for_conf == "keypoints_var":
-        encoder_for_conf = "keypoints"
 
     suffix = args.suffix
     if args.bc_step is not None:
         suffix += "_step_" + args.bc_step
 
-    image_dim = (480, 480) if args.panda else (256, 256)
+    image_dim = realsense_cam_resolution_cropped if env_is_panda \
+        else sim_cam_resolution
+    image_crop = realsense_cam_crop if env_is_panda else None
 
     selected_encoder_config = encoder_configs[encoder_for_conf]
-    selected_encoder_config["obs_config"] = {
-        "image_dim": image_dim
-    }
+    selected_encoder_config["obs_config"] = {"image_dim": image_dim}
 
-    config_defaults = {
+    obs_dropout = float(args.obs_dropout) if args.obs_dropout else None
+
+    config = {
         "eval_config": {
-            "episodes": 20 if args.panda else 200,
+            "episodes": 25 if env_is_panda else 200,
             "seed": seed,
 
-            "panda": args.panda,
-            "teleop": True,
-
-            "crop_left": 160 if args.panda else None,
-
-            "task": args.task,
-
-            "shoulders_on": False,
-            "wrist_on": True,
-            "overhead_on": True,
-
-            # TODO: this should be set automatically or configured.
-            # does this currently lead to issues with the real robot?
-            "image_size": image_dim,
-            "camera_pose": camera_pose,
-
-            "static_env": False,
-            "headless_env": not args.render,
             "viz": args.viz and args.render,
 
             "kp_per_channel_viz": False,
             "show_channels": [0, 4, 8, 12],  # None,
 
-            "obs_dropout": float(
-                args.obs_dropout) if args.obs_dropout else None,
+            "obs_dropout": obs_dropout,
+        },
+        "env_config": {
+            "env": env,
+            "task": args.task,
+
+            "cameras": tuple(args.cam),
+            "camera_pose": camera_pose,
+            "image_size": image_dim,
+            "image_crop": image_crop,
+
+            "static_env": False,
+            "headless_env": not args.render,
+
+            "scale_action": True,
+            "delay_gripper": True,
+
+            "gripper_plot": True,
+
+            # Panda keys
+            "teleop": True,
+            "eval": True,
+
+            # ManiSkill keys
+            "render_sapien": False,
+            "background": args.background,
+            "model_ids": tuple(args.model_ids),
         },
 
         "policy_config": {
@@ -510,35 +419,33 @@ if __name__ == "__main__":
             "pretrained_on": args.pretrained_on or args.task,
             "pretrain_feedback": args.pretrain_feedback,
 
-            "ground_truth_mask": args.mask or args.object_pose,
-            "ground_truth_object_pose": args.object_pose,
-
-            "cams": args.cam,
+            "cameras": args.cam,
 
             "sample_freq": None,  # 5  # downsample the trajectories to this freq
             "sample_correction": 1,  # correction factor for subsampled data
-            "fragment_length": 30,
+            # NOTE: not resetting the LSTM state seems to work better
+            "fragment_length": -1,  # 30,
 
             "data_root": "data",
         },
     }
 
-    config_defaults["policy_config"].update(policy_config)
+    config["policy_config"].update(policy_config)
 
-    config_defaults = apply_machine_config(config_defaults)
+    config = apply_machine_config(config)
 
-    if config_defaults["policy_config"]["use_ee_pose"]:
-        config_defaults["policy_config"]["proprio_dim"] = 7
+    if config["policy_config"]["use_ee_pose"]:
+        config["policy_config"]["proprio_dim"] = 7
     else:
-        config_defaults["policy_config"]["proprio_dim"] = 8
+        config["policy_config"]["proprio_dim"] = 8
 
-    if config_defaults["policy_config"]["add_gripper_state"]:
-        config_defaults["policy_config"]["proprio_dim"] += 1
+    if config["policy_config"]["add_gripper_state"]:
+        config["policy_config"]["proprio_dim"] += 1
 
-    wandb_mode = "offline" if args.panda else \
+    wandb_mode = "offline" if env_is_panda else \
         "disabled" if args.disable_wandb else "online"
-    wandb.init(config=config_defaults, project="ceiling_eval", mode=wandb_mode)
+    wandb.init(config=config, project="bask_eval", mode=wandb_mode)
     wandb.run.summary["bc_step"] = args.bc_step
 
-    config = wandb.config  # in case the sweep gives different values
-    main(config, config_defaults, args.refine_init)
+    wandb_config = wandb.config  # in case the sweep gives different values
+    main(config)
