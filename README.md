@@ -172,7 +172,7 @@ python src/kp_encode_trajectories.py -f cloning -m -o -t PickSingleYCB-v0-065-a_
 
 - Policy learning
 ```
-python src/kp_encode_trajectories.py -f cloning -m -o -t PickSingleYCB-v0-065-a_cups -p encoder -e keypoints --cam base --pretrain_feedback dcm --config configs/maniskill-ycb-cups-pretrain.py --kp_pre_complete my-kp-selection
+python src/behavior_cloning.py -f cloning -m -o -t PickSingleYCB-v0-065-a_cups -p encoder -e keypoints --cam base --pretrain_feedback dcm --config configs/maniskill-ycb-cups-pretrain.py --kp_pre_complete my-kp-selection
 ```
 
 - Evaluation
@@ -183,5 +183,15 @@ python src/evaluate.py -f cloning -m -o -t PickSingleYCB-v0-065-a_cups -p encode
 
 ## Model Checkpoints
 
-For downloading model checkpoints, please visit the [project website](http://bask.cs.uni-freiburg.de/).
-Checkpoints are currently being uploaded and will be available shortly.
+You can download our pretrained model checkpoints by clicking the links below. Afterwards place them in `<data_root>/<task>/`.
+For additional checkpoints, please contact the authors.
+
+[BASK on Microwave](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-CloseMicrowave_policy.pt)
+
+[BASK on Lid](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-TakeLidOffSaucepan_policy.pt)
+
+[BASK on Phone](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-PhoneOnBase_policy.pt)
+
+[BASK on Rubbish](http://bask.cs.uni-freiburg.de/datasets/cloning_keypoints_pon-PutRubbishInBin_policy.pt)
+
+
