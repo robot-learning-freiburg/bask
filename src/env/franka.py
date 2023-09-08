@@ -423,8 +423,8 @@ class FrankaEnv(BaseEnvironment):
             camera_obs[cam] = SingleCamObservation(**{
                 'rgb': torch.Tensor(img_frames[i]),
                 'depth': torch.Tensor(depth_frames[i]),
-                'extrinsics': torch.Tensor(extrinsics[i]),
-                'intrinsics': self.intrinsics[i],
+                'extr': torch.Tensor(extrinsics[i]),
+                'intr': self.intrinsics[i],
             }, batch_size=empty_batchsize)
 
         multicam_obs = dict_to_tensordict(

@@ -5,9 +5,9 @@ import torch
 from loguru import logger
 from pyrep.const import RenderMode
 from pyrep.errors import IKError
+import rlbench
 from rlbench.action_modes import ActionMode, ArmActionMode
 from rlbench.backend.observation import Observation as RLBenchObservation
-from rlbench.environment import Environment as RLBenchEnvironment
 from rlbench.observation_config import CameraConfig, ObservationConfig
 from rlbench.task_environment import InvalidActionError
 from rlbench.tasks import (ArmScan, CloseMicrowave, PhoneBase, PhoneOnBase,
@@ -101,7 +101,7 @@ class RLBenchEnvironment(BaseEnvironment):
             action_mode = ActionMode(ArmActionMode.EE_POSE_EE_FRAME)
             self.do_postprocess_actions = True
 
-        self.env = RLBenchEnvironment(
+        self.env = rlbench.environment.Environment(
             action_mode,
             obs_config=obs_config,
             static_positions=config["static_env"],
@@ -118,16 +118,16 @@ class RLBenchEnvironment(BaseEnvironment):
     def setup_camera_controls(self, config):
         self.camera_pose = config["camera_pose"]
 
-        self.camera_assoc = {}
-        if config["shoulders_on"]:
-            self.camera_assoc["shoulder_left"] = \
-                self.env._scene._cam_over_shoulder_left
-            self.camera_assoc["shoulder_right"] = \
-                self.env._scene._cam_over_shoulder_right
-        if config["wrist_on"]:
-            self.camera_assoc["wrist"] = self.env._scene._cam_wrist
-        if config["overhead_on"]:
-            self.camera_assoc["overhead"] = self.env._scene._cam_overhead
+        camera_map = {
+            "left_shoulder": self.env._scene._cam_over_shoulder_left,
+            "right_shoulder": self.env._scene._cam_over_shoulder_right,
+            "wrist": self.env._scene._cam_wrist,
+            "overhead": self.env._scene._cam_overhead,
+            "front": self.env._scene._cam_front,
+        }
+
+        self.camera_map = {k: v for k, v in camera_map.items()
+                             if k in self.cameras}
 
     def reset(self):
         super().reset()
@@ -186,7 +186,7 @@ class RLBenchEnvironment(BaseEnvironment):
         if postprocess:
             action_delayed = self.postprocess_action(
                 action, scale_action=scale_action, delay_gripper=delay_gripper,
-                return_euler=True)
+                return_euler=False)
         else:
             action_delayed = action
 
@@ -218,13 +218,13 @@ class RLBenchEnvironment(BaseEnvironment):
     def get_camera_pose(self) -> dict[str, np.ndarray]:
 
         return {
-            name: cam.get_pose() for name, cam in self.camera_assoc.items()
+            name: cam.get_pose() for name, cam in self.camera_map.items()
         }
 
     def set_camera_pose(self, pos_dict: dict[str, np.ndarray]) -> None:
         for camera_name, pos in pos_dict.items():
-            if camera_name in self.camera_assoc:
-                camera = self.camera_assoc[camera_name]
+            if camera_name in self.camera_map:
+                camera = self.camera_map[camera_name]
                 camera.set_pose(pos)
 
     def process_observation(self, obs: RLBenchObservation) -> SceneObservation:
@@ -247,29 +247,28 @@ class RLBenchEnvironment(BaseEnvironment):
             rgb = getattr(obs, cam + "_rgb").transpose((2, 0, 1)) / 255
             depth = getattr(obs, cam + "_depth")
             mask = getattr(obs, cam + "_mask").astype(int)
-            ext = getattr(obs.misc, cam + "_camera_extrinsics")
-            intr = getattr(obs.misc, cam + "_camera_intrinsics").float()
+            extr = obs.misc[cam + "_camera_extrinsics"]
+            intr = obs.misc[cam + "_camera_intrinsics"].astype(float)
 
             camera_obs[cam] = SingleCamObservation(**{
                 "rgb": torch.Tensor(rgb),
                 "depth": torch.Tensor(depth),
                 "mask": torch.Tensor(mask).to(torch.uint8),
-                "ext": torch.Tensor(ext),
-                "int": intr,
+                "extr": torch.Tensor(extr),
+                "intr": torch.Tensor(intr),
             }, batch_size=empty_batchsize)
 
         multicam_obs = dict_to_tensordict(
             {'_order ': CameraOrder._create(self.cameras)} | camera_obs)
 
-
         joint_pos = torch.Tensor(obs.joint_positions)
         joint_vel = torch.Tensor(obs.joint_velocities)
 
         ee_pose = torch.Tensor(obs.gripper_pose)
-        gripper_open = torch.Tensor(obs.gripper_open)
+        gripper_open = torch.Tensor([obs.gripper_open])
 
-
-        object_poses = {'stacked': torch.Tensor(obs.task_low_dim_state)}
+        object_poses = dict_to_tensordict(
+            {'stacked': torch.Tensor(obs.task_low_dim_state)})
 
         obs = SceneObservation(cameras=multicam_obs, ee_pose=ee_pose,
                                object_poses=object_poses,

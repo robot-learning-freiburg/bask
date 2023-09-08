@@ -29,7 +29,9 @@ def get_full_task_name(config):
     if config["env_config"]["background"]:
         task_name += "-" + config["env_config"]["background"]
 
-    task_name += "-" + "_".join([m for m in config["env_config"]["model_ids"]])
+    if config["env_config"]["model_ids"]:
+        task_name += "-" + "_".join(
+            [m for m in config["env_config"]["model_ids"]])
 
     return task_name
 
