@@ -20,6 +20,9 @@ def try_empty_cuda_cache():
         empty_cuda_cache()
     except NameError:
         logger.warning("Could not empty cuda cache as CUDA seems not to run.")
+    except ValueError:
+        assert device.type == 'cpu'
+        pass  # running on CPU
 
 
 def empty_cuda_cache():

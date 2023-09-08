@@ -23,3 +23,5 @@ nvitop
 timm
 # maniskill2
 tensordict
+pyrender
+open3d
