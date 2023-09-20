@@ -4,6 +4,7 @@ Repository providing the source code for the paper "The Treachery of Images: Bay
 
 Please cite the paper as follows:
 
+```
 @ARTICLE{vonhartz2023treachery,
   author={von Hartz, Jan Ole and Chisari, Eugenio and Welschehold, Tim and Burgard, Wolfram and Boedecker, Joschka and Valada, Abhinav},
   journal={IEEE Robotics and Automation Letters}, 
@@ -14,7 +15,7 @@ Please cite the paper as follows:
   pages={6931-6938},
   doi={10.1109/LRA.2023.3313917}
  }
-
+```
 
 # License
 For academic usage, the code is released under the GPLv3 license. For any commercial purpose, please contact the authors.
