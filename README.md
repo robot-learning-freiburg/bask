@@ -4,12 +4,16 @@ Repository providing the source code for the paper "The Treachery of Images: Bay
 
 Please cite the paper as follows:
 
-    @article{vonHartz2023treachery,
-    title={The Treachery of Images: Bayesian Scene Keypoints for Deep Policy Learning in Robotic Manipulation},
-    author={von Hartz, Jan Ole and Chisari, Eugenio and Welschehold, Tim and Burgard, Wolfram and Boedecker, Joschka and Valada, Abhinav},
-    journal={arXiv preprint arXiv:2305.04718},
-    year={2023}
-    }
+@ARTICLE{vonhartz2023treachery,
+  author={von Hartz, Jan Ole and Chisari, Eugenio and Welschehold, Tim and Burgard, Wolfram and Boedecker, Joschka and Valada, Abhinav},
+  journal={IEEE Robotics and Automation Letters}, 
+  title={The Treachery of Images: Bayesian Scene Keypoints for Deep Policy Learning in Robotic Manipulation}, 
+  year={2023},
+  volume={8},
+  number={11},
+  pages={6931-6938},
+  doi={10.1109/LRA.2023.3313917}
+ }
 
 
 # License
