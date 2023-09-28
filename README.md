@@ -1,6 +1,6 @@
 # The Treachery of Images: Bayesian Scene Keypoints for Deep Policy Learning in Robotic Manipulation
 
-Repository providing the source code for the paper "The Treachery of Images: Bayesian Scene Keypoints for Deep Policy Learning in Robotic Manipulation ", see the [project website](http://bask.cs.uni-freiburg.de/).
+Repository providing the source code for the paper "The Treachery of Images: Bayesian Scene Keypoints for Deep Policy Learning in Robotic Manipulation", see the [project website](http://bask.cs.uni-freiburg.de/) and [video](https://youtu.be/p8QaBW8jw8Y).
 
 Please cite the paper as follows:
 
